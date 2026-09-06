@@ -22,7 +22,9 @@
     "enabled": true
   },
   "format": {
-    "enabled": true
+    "enabled": false,
+    "keywordCase": "upper",
+    "constantCase": "upper"
   },
   "pglinter": {
     "enabled": false
