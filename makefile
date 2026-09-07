@@ -2,8 +2,8 @@
 export
 
 DRIVER ?= postgres
-PGPORT ?= 5432
-DB_STRING ?= postgresql://$(PGUSER):$(PGPASSWORD)@$(PGHOST):$(PGPORT)/$(PGDATABASE)?sslmode=disable
+POSTGRES_PORT ?= 5432
+DB_STRING ?= postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable
 MIGRATIONS_DIR ?= db/migrations
 
 GOOSE_CMD = go tool goose
