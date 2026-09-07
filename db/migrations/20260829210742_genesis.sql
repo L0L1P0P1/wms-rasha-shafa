@@ -35,16 +35,25 @@ CREATE TABLE sku_packaging_units (
     sku_id bigint NOT NULL 
         REFERENCES stock_keeping_units(id) 
         ON DELETE CASCADE,
-    unit_name text NOT NULL, -- 'EACH', 'CASE_12', 'PALLET_48'
+    unit_name text NOT NULL,
     conversion_factor numeric(12, 4) NOT NULL CHECK (conversion_factor > 0),
-    barcode text COLLATE "C" UNIQUE,
+    barcode text COLLATE "C" UNIQUE,     -- Scannable UPC, EAN, or ITF-14
+    is_base_unit boolean NOT NULL DEFAULT false,
     allows_break_bulk boolean NOT NULL DEFAULT false,
 
+    -- Unique unit name per SKU
     CONSTRAINT uq_sku_unit_name UNIQUE (sku_id, unit_name),
-    CONSTRAINT chk_discrete_conversion CHECK (
-        conversion_factor = floor(conversion_factor) OR conversion_factor > 0
+
+    -- Base unit must always have a multiplier of 1.0000
+    CONSTRAINT chk_base_unit_factor CHECK (
+        NOT is_base_unit OR conversion_factor = 1.0000
     )
 );
+
+-- Enforce exactly one base unit per SKU
+CREATE UNIQUE INDEX uq_sku_single_base_unit 
+    ON sku_packaging_units (sku_id) 
+    WHERE is_base_unit = true;
 
 CREATE INDEX idx_packaging_units_sku ON sku_packaging_units (sku_id);
 CREATE INDEX idx_packaging_units_barcode ON sku_packaging_units (barcode);
