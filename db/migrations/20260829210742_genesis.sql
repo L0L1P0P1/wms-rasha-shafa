@@ -9,54 +9,67 @@ CREATE EXTENSION IF NOT EXISTS ltree;
 -- 1. MASTER DATA: SKUS, PACKAGING & LOTS
 -- ------------------------------------------------------------
 
+CREATE TYPE uom AS ENUM (
+  'EACH',
+  'Kg',
+  'g',
+  'm',
+  'L',
+  'mL'
+);
+
 CREATE TABLE stock_keeping_units (
     id bigint 
         GENERATED ALWAYS AS IDENTITY (START WITH 10000) 
         PRIMARY KEY,
     sku_code text COLLATE "C" NOT NULL UNIQUE,
     name text NOT NULL,
-    base_uom text NOT NULL DEFAULT 'EA',
+    base_uom uom NOT NULL DEFAULT 'EACH',
     is_discrete boolean NOT NULL DEFAULT true,
     requires_lot_tracking boolean NOT NULL DEFAULT false,
-    weight_kg numeric(10, 3) CHECK (weight_kg > 0),
-    volume_cm3 numeric(12, 2) CHECK (volume_cm3 > 0),
     attributes jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_skus_sku_code ON stock_keeping_units (sku_code);
 CREATE INDEX idx_skus_name_trgm ON stock_keeping_units USING gin (name gin_trgm_ops);
 CREATE INDEX idx_skus_attributes ON stock_keeping_units USING gin (attributes);
 
 CREATE TABLE sku_packaging_units (
-    id bigint 
-        GENERATED ALWAYS AS IDENTITY 
-        PRIMARY KEY,
-    sku_id bigint NOT NULL 
-        REFERENCES stock_keeping_units(id) 
-        ON DELETE CASCADE,
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sku_id bigint NOT NULL REFERENCES stock_keeping_units(id) ON DELETE CASCADE,
     unit_name text NOT NULL,
     conversion_factor numeric(12, 4) NOT NULL CHECK (conversion_factor > 0),
-    barcode text COLLATE "C" UNIQUE,     -- Scannable UPC, EAN, or ITF-14
+    parent_packaging_unit_id bigint,
     is_base_unit boolean NOT NULL DEFAULT false,
     allows_break_bulk boolean NOT NULL DEFAULT false,
+    barcode text COLLATE "C" UNIQUE,
+    tare_weight_kg numeric(10, 3) CHECK (tare_weight_kg >= 0),
+    gross_volume_cm3 numeric(12, 2) CHECK (gross_volume_cm3 > 0),
 
-    -- Unique unit name per SKU
     CONSTRAINT uq_sku_unit_name UNIQUE (sku_id, unit_name),
+    
+    CONSTRAINT uq_sku_packaging_units_id_sku UNIQUE (id, sku_id),
 
-    -- Base unit must always have a multiplier of 1.0000
     CONSTRAINT chk_base_unit_factor CHECK (
         NOT is_base_unit OR conversion_factor = 1.0000
+    ),
+    CONSTRAINT fk_pku_same_sku_parent 
+        FOREIGN KEY (parent_packaging_unit_id, sku_id) 
+        REFERENCES sku_packaging_units(id, sku_id) 
+        ON DELETE RESTRICT,
+    CONSTRAINT chk_base_unit_no_parent CHECK (
+        NOT is_base_unit OR parent_packaging_unit_id IS NULL
+    ),
+    CONSTRAINT chk_no_self_parent CHECK (
+        parent_packaging_unit_id IS NULL OR parent_packaging_unit_id != id
     )
 );
 
--- Enforce exactly one base unit per SKU
 CREATE UNIQUE INDEX uq_sku_single_base_unit 
     ON sku_packaging_units (sku_id) 
     WHERE is_base_unit = true;
 
 CREATE INDEX idx_packaging_units_sku ON sku_packaging_units (sku_id);
-CREATE INDEX idx_packaging_units_barcode ON sku_packaging_units (barcode);
 
 CREATE TYPE lot_status AS ENUM (
     'AVAILABLE',
@@ -78,7 +91,8 @@ CREATE TABLE lots (
     expires_at date,
     received_at timestamptz NOT NULL DEFAULT now(),
 
-    CONSTRAINT uq_sku_lot_number UNIQUE (sku_id, lot_number)
+    CONSTRAINT uq_sku_lot_number UNIQUE (sku_id, lot_number),
+    CONSTRAINT uq_sku_lot_id UNIQUE (id, sku_id)
 );
 
 CREATE INDEX idx_lots_sku ON lots (sku_id);
@@ -133,12 +147,14 @@ CREATE TABLE inventory_balances (
     node_id bigint NOT NULL 
         REFERENCES storage_nodes(id) 
         ON DELETE RESTRICT,
-    sku_id bigint NOT NULL 
-        REFERENCES stock_keeping_units(id) 
+    pku_id bigint NOT NULL 
+        REFERENCES sku_packaging_units(id) 
         ON DELETE RESTRICT,
     lot_id bigint 
         REFERENCES lots(id) 
         ON DELETE RESTRICT,
+
+    is_sealed bool NOT NULL DEFAULT true,
 
     on_hand numeric(12, 4) NOT NULL DEFAULT 0,
     allocated numeric(12, 4) NOT NULL DEFAULT 0,
@@ -151,11 +167,11 @@ CREATE TABLE inventory_balances (
 
 -- Unique constraint ensuring one balance entry per SKU/Lot per node
 CREATE UNIQUE INDEX uq_node_inventory 
-    ON inventory_balances (node_id, sku_id, lot_id) NULLS NOT DISTINCT;
+    ON inventory_balances (node_id, pku_id, lot_id, is_sealed) NULLS NOT DISTINCT;
 
 -- Fast index for picking and allocation search
 CREATE INDEX idx_balances_reservable 
-    ON inventory_balances (sku_id, lot_id, on_hand, allocated) 
+    ON inventory_balances (pku_id, lot_id, on_hand, allocated) 
     WHERE (on_hand - allocated) > 0;
 
 CREATE INDEX idx_balances_node ON inventory_balances (node_id);
@@ -192,18 +208,18 @@ CREATE TABLE outbound_order_lines (
     order_id bigint NOT NULL 
         REFERENCES outbound_orders(id) 
         ON DELETE CASCADE,
-    sku_id bigint NOT NULL 
-        REFERENCES stock_keeping_units(id) 
+    pku_id bigint NOT NULL 
+        REFERENCES sku_packaging_units(id) 
         ON DELETE RESTRICT,
     requested_quantity numeric(12, 4) NOT NULL CHECK (requested_quantity > 0),
     fulfilled_quantity numeric(12, 4) NOT NULL DEFAULT 0 CHECK (fulfilled_quantity >= 0),
 
-    CONSTRAINT uq_order_line_sku UNIQUE (order_id, sku_id),
+    CONSTRAINT uq_order_line_pku UNIQUE (order_id, pku_id),
     CONSTRAINT chk_fulfillment_bounds CHECK (fulfilled_quantity <= requested_quantity)
 );
 
 CREATE INDEX idx_order_lines_order ON outbound_order_lines (order_id);
-CREATE INDEX idx_order_lines_sku ON outbound_order_lines (sku_id);
+CREATE INDEX idx_order_lines_pku ON outbound_order_lines (pku_id);
 
 CREATE TABLE inventory_allocations (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -241,8 +257,8 @@ CREATE TABLE inventory_movements (
     id bigint 
         GENERATED ALWAYS AS IDENTITY 
         PRIMARY KEY,
-    sku_id bigint NOT NULL 
-        REFERENCES stock_keeping_units(id) 
+    pku_id bigint NOT NULL 
+        REFERENCES sku_packaging_units(id) 
         ON DELETE RESTRICT,
     lot_id bigint 
         REFERENCES lots(id) 
@@ -261,6 +277,7 @@ CREATE TABLE inventory_movements (
     allocation_id bigint 
         REFERENCES inventory_allocations(id) 
         ON DELETE SET NULL,
+    is_sealed boolean NOT NULL DEFAULT true,
     operator_id text COLLATE "C" NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
 
@@ -274,7 +291,7 @@ CREATE TABLE inventory_movements (
     )
 );
 
-CREATE INDEX idx_movements_sku ON inventory_movements (sku_id, created_at DESC);
+CREATE INDEX idx_movements_pku ON inventory_movements (pku_id, created_at DESC);
 CREATE INDEX idx_movements_lot ON inventory_movements (lot_id, created_at DESC);
 CREATE INDEX idx_movements_source ON inventory_movements (source_node_id, created_at DESC) WHERE source_node_id IS NOT NULL;
 CREATE INDEX idx_movements_dest ON inventory_movements (destination_node_id, created_at DESC) WHERE destination_node_id IS NOT NULL;
@@ -284,7 +301,7 @@ CREATE INDEX idx_movements_allocation ON inventory_movements (allocation_id) WHE
 -- 6. INBOUND PROCUREMENT & TASKS
 -- ------------------------------------------------------------
 
-CREATE TYPE po_status AS ENUM (
+CREATE TYPE inbound_order_status AS ENUM (
     'DRAFT',
     'ISSUED',
     'PARTIALLY_RECEIVED',
@@ -292,31 +309,31 @@ CREATE TYPE po_status AS ENUM (
     'CANCELLED'
 );
 
-CREATE TABLE purchase_orders (
+CREATE TABLE inbound_orders (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     po_number text COLLATE "C" NOT NULL UNIQUE,
     vendor_name text NOT NULL,
-    status po_status NOT NULL DEFAULT 'ISSUED',
+    status inbound_order_status NOT NULL DEFAULT 'ISSUED',
     expected_delivery date,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE purchase_order_lines (
+CREATE TABLE inbound_order_lines (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    purchase_order_id bigint NOT NULL 
-        REFERENCES purchase_orders(id) 
+    inbound_order_id bigint NOT NULL 
+        REFERENCES inbound_orders(id) 
         ON DELETE CASCADE,
-    sku_id bigint NOT NULL 
-        REFERENCES stock_keeping_units(id) 
+    pku_id bigint NOT NULL 
+        REFERENCES sku_packaging_units(id) 
         ON DELETE RESTRICT,
     expected_quantity numeric(12, 4) NOT NULL CHECK (expected_quantity > 0),
     received_quantity numeric(12, 4) NOT NULL DEFAULT 0 CHECK (received_quantity >= 0),
 
-    CONSTRAINT uq_po_line_sku UNIQUE (purchase_order_id, sku_id)
+    CONSTRAINT uq_po_line_pku UNIQUE (inbound_order_id, pku_id)
 );
 
-CREATE INDEX idx_po_lines_po ON purchase_order_lines (purchase_order_id);
+CREATE INDEX idx_po_lines_po ON inbound_order_lines (inbound_order_id);
 
 CREATE TYPE task_type AS ENUM (
     'PUTAWAY',
@@ -341,7 +358,7 @@ CREATE TABLE warehouse_tasks (
     priority integer NOT NULL DEFAULT 100,
 
     -- Stock-level directives
-    sku_id bigint REFERENCES stock_keeping_units(id) ON DELETE RESTRICT,
+    pku_id bigint REFERENCES sku_packaging_units(id) ON DELETE RESTRICT,
     lot_id bigint REFERENCES lots(id) ON DELETE RESTRICT,
     quantity numeric(12, 4) CHECK (quantity > 0),
 
@@ -359,7 +376,7 @@ CREATE TABLE warehouse_tasks (
     completed_at timestamptz,
 
     CONSTRAINT chk_task_payload CHECK (
-        target_node_id IS NOT NULL OR (sku_id IS NOT NULL AND quantity IS NOT NULL)
+        target_node_id IS NOT NULL OR (pku_id IS NOT NULL AND quantity IS NOT NULL)
     )
 );
 
@@ -499,9 +516,9 @@ DROP TABLE IF EXISTS warehouse_tasks;
 DROP TYPE IF EXISTS task_status;
 DROP TYPE IF EXISTS task_type;
 
-DROP TABLE IF EXISTS purchase_order_lines;
-DROP TABLE IF EXISTS purchase_orders;
-DROP TYPE IF EXISTS po_status;
+DROP TABLE IF EXISTS inbound_order_lines;
+DROP TABLE IF EXISTS inbound_orders;
+DROP TYPE IF EXISTS inbound_order_status;
 
 DROP TABLE IF EXISTS inventory_movements;
 DROP TYPE IF EXISTS movement_reason;
@@ -519,6 +536,7 @@ DROP TABLE IF EXISTS lots;
 DROP TYPE IF EXISTS lot_status;
 DROP TABLE IF EXISTS sku_packaging_units;
 DROP TABLE IF EXISTS stock_keeping_units;
+DROP TYPE IF EXISTS uom;
 
 -- +goose StatementBegin
 DROP EXTENSION IF EXISTS ltree;
