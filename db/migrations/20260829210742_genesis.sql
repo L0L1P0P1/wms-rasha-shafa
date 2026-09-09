@@ -10,12 +10,12 @@ CREATE EXTENSION IF NOT EXISTS ltree;
 -- ------------------------------------------------------------
 
 CREATE TYPE uom AS ENUM (
-  'EACH',
-  'Kg',
-  'g',
-  'm',
-  'L',
-  'mL'
+    'EACH',
+    'Kg',
+    'g',
+    'm',
+    'L',
+    'mL'
 );
 
 CREATE TABLE stock_keeping_units (
@@ -47,7 +47,6 @@ CREATE TABLE sku_packaging_units (
     gross_volume_cm3 numeric(12, 2) CHECK (gross_volume_cm3 > 0),
 
     CONSTRAINT uq_sku_unit_name UNIQUE (sku_id, unit_name),
-    
     CONSTRAINT uq_sku_packaging_units_id_sku UNIQUE (id, sku_id),
 
     CONSTRAINT chk_base_unit_factor CHECK (
@@ -95,7 +94,6 @@ CREATE TABLE lots (
     CONSTRAINT uq_sku_lot_id UNIQUE (id, sku_id)
 );
 
-CREATE INDEX idx_lots_sku ON lots (sku_id);
 CREATE INDEX idx_lots_expiration ON lots (expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX idx_lots_status ON lots (status);
 
@@ -122,7 +120,7 @@ CREATE TABLE storage_nodes (
         REFERENCES storage_nodes(id) 
         ON DELETE RESTRICT,
     path ltree NOT NULL,
-    code text COLLATE "C" NOT NULL UNIQUE, -- Scannable identifier (Bin barcode or LPN)
+    code text COLLATE "C" NOT NULL UNIQUE,
     node_type storage_node_type NOT NULL DEFAULT 'BIN',
     is_movable boolean NOT NULL DEFAULT false,
     max_weight_kg numeric(10, 2) CHECK (max_weight_kg > 0),
@@ -147,31 +145,42 @@ CREATE TABLE inventory_balances (
     node_id bigint NOT NULL 
         REFERENCES storage_nodes(id) 
         ON DELETE RESTRICT,
-    pku_id bigint NOT NULL 
-        REFERENCES sku_packaging_units(id) 
+    sku_id bigint NOT NULL 
+        REFERENCES stock_keeping_units(id) 
         ON DELETE RESTRICT,
-    lot_id bigint 
-        REFERENCES lots(id) 
-        ON DELETE RESTRICT,
+    pku_id bigint NOT NULL,
+    lot_id bigint,
 
-    is_sealed bool NOT NULL DEFAULT true,
+    is_sealed boolean NOT NULL DEFAULT true,
+    package_count numeric(12, 4) NOT NULL DEFAULT 1 CHECK (package_count >= 0),
 
+    -- Quantities always stored in the SKU's atomic base UOM
     on_hand numeric(12, 4) NOT NULL DEFAULT 0,
     allocated numeric(12, 4) NOT NULL DEFAULT 0,
     updated_at timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT chk_on_hand_positive CHECK (on_hand >= 0),
     CONSTRAINT chk_allocated_positive CHECK (allocated >= 0),
-    CONSTRAINT chk_allocated_le_on_hand CHECK (allocated <= on_hand)
+    CONSTRAINT chk_allocated_le_on_hand CHECK (allocated <= on_hand),
+
+    -- Composite foreign keys prevent cross-SKU lot/PKU mixing
+    CONSTRAINT fk_balance_pku 
+        FOREIGN KEY (pku_id, sku_id) 
+        REFERENCES sku_packaging_units(id, sku_id) 
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_balance_lot 
+        FOREIGN KEY (lot_id, sku_id) 
+        REFERENCES lots(id, sku_id) 
+        ON DELETE RESTRICT
 );
 
--- Unique constraint ensuring one balance entry per SKU/Lot per node
+-- Unique entry per Node + PKU + Lot + Sealed State
 CREATE UNIQUE INDEX uq_node_inventory 
     ON inventory_balances (node_id, pku_id, lot_id, is_sealed) NULLS NOT DISTINCT;
 
--- Fast index for picking and allocation search
+-- Fast index for reservation and picking engine
 CREATE INDEX idx_balances_reservable 
-    ON inventory_balances (pku_id, lot_id, on_hand, allocated) 
+    ON inventory_balances (sku_id, pku_id, is_sealed, lot_id, on_hand, allocated) 
     WHERE (on_hand - allocated) > 0;
 
 CREATE INDEX idx_balances_node ON inventory_balances (node_id);
@@ -208,17 +217,23 @@ CREATE TABLE outbound_order_lines (
     order_id bigint NOT NULL 
         REFERENCES outbound_orders(id) 
         ON DELETE CASCADE,
-    pku_id bigint NOT NULL 
-        REFERENCES sku_packaging_units(id) 
+    sku_id bigint NOT NULL 
+        REFERENCES stock_keeping_units(id) 
         ON DELETE RESTRICT,
+    pku_id bigint NOT NULL,
     requested_quantity numeric(12, 4) NOT NULL CHECK (requested_quantity > 0),
     fulfilled_quantity numeric(12, 4) NOT NULL DEFAULT 0 CHECK (fulfilled_quantity >= 0),
 
+    CONSTRAINT fk_order_line_pku 
+        FOREIGN KEY (pku_id, sku_id) 
+        REFERENCES sku_packaging_units(id, sku_id) 
+        ON DELETE RESTRICT,
     CONSTRAINT uq_order_line_pku UNIQUE (order_id, pku_id),
     CONSTRAINT chk_fulfillment_bounds CHECK (fulfilled_quantity <= requested_quantity)
 );
 
 CREATE INDEX idx_order_lines_order ON outbound_order_lines (order_id);
+CREATE INDEX idx_order_lines_sku ON outbound_order_lines (sku_id);
 CREATE INDEX idx_order_lines_pku ON outbound_order_lines (pku_id);
 
 CREATE TABLE inventory_allocations (
@@ -248,6 +263,8 @@ CREATE TYPE movement_reason AS ENUM (
     'PICK',
     'REPLENISHMENT',
     'INTERNAL_TRANSFER',
+    'BREAK_PACKAGE',
+    'REPACKAGE',
     'CYCLE_COUNT',
     'SCRAP_DAMAGED',
     'RETURN'
@@ -257,12 +274,12 @@ CREATE TABLE inventory_movements (
     id bigint 
         GENERATED ALWAYS AS IDENTITY 
         PRIMARY KEY,
-    pku_id bigint NOT NULL 
-        REFERENCES sku_packaging_units(id) 
+    sku_id bigint NOT NULL 
+        REFERENCES stock_keeping_units(id) 
         ON DELETE RESTRICT,
-    lot_id bigint 
-        REFERENCES lots(id) 
-        ON DELETE RESTRICT,
+    pku_id bigint NOT NULL,
+    lot_id bigint,
+    package_count numeric(12, 4) NOT NULL DEFAULT 1 CHECK (package_count >= 0),
     quantity numeric(12, 4) NOT NULL CHECK (quantity > 0),
 
     source_node_id bigint 
@@ -276,21 +293,29 @@ CREATE TABLE inventory_movements (
     reference_id text COLLATE "C",
     allocation_id bigint 
         REFERENCES inventory_allocations(id) 
-        ON DELETE SET NULL,
+        ON DELETE RESTRICT,
     is_sealed boolean NOT NULL DEFAULT true,
     operator_id text COLLATE "C" NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
 
-    -- Must originate somewhere or terminate somewhere
+    CONSTRAINT fk_movement_pku 
+        FOREIGN KEY (pku_id, sku_id) 
+        REFERENCES sku_packaging_units(id, sku_id) 
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_movement_lot 
+        FOREIGN KEY (lot_id, sku_id) 
+        REFERENCES lots(id, sku_id) 
+        ON DELETE RESTRICT,
+
     CONSTRAINT chk_movement_endpoints CHECK (
         source_node_id IS NOT NULL OR destination_node_id IS NOT NULL
     ),
-    -- Origin and destination cannot be identical
     CONSTRAINT chk_movement_distinct_endpoints CHECK (
         source_node_id IS NULL OR destination_node_id IS NULL OR source_node_id != destination_node_id
     )
 );
 
+CREATE INDEX idx_movements_sku ON inventory_movements (sku_id, created_at DESC);
 CREATE INDEX idx_movements_pku ON inventory_movements (pku_id, created_at DESC);
 CREATE INDEX idx_movements_lot ON inventory_movements (lot_id, created_at DESC);
 CREATE INDEX idx_movements_source ON inventory_movements (source_node_id, created_at DESC) WHERE source_node_id IS NOT NULL;
@@ -324,16 +349,22 @@ CREATE TABLE inbound_order_lines (
     inbound_order_id bigint NOT NULL 
         REFERENCES inbound_orders(id) 
         ON DELETE CASCADE,
-    pku_id bigint NOT NULL 
-        REFERENCES sku_packaging_units(id) 
+    sku_id bigint NOT NULL 
+        REFERENCES stock_keeping_units(id) 
         ON DELETE RESTRICT,
+    pku_id bigint NOT NULL,
     expected_quantity numeric(12, 4) NOT NULL CHECK (expected_quantity > 0),
     received_quantity numeric(12, 4) NOT NULL DEFAULT 0 CHECK (received_quantity >= 0),
 
+    CONSTRAINT fk_po_line_pku 
+        FOREIGN KEY (pku_id, sku_id) 
+        REFERENCES sku_packaging_units(id, sku_id) 
+        ON DELETE RESTRICT,
     CONSTRAINT uq_po_line_pku UNIQUE (inbound_order_id, pku_id)
 );
 
 CREATE INDEX idx_po_lines_po ON inbound_order_lines (inbound_order_id);
+CREATE INDEX idx_po_lines_sku ON inbound_order_lines (sku_id);
 
 CREATE TYPE task_type AS ENUM (
     'PUTAWAY',
@@ -358,8 +389,10 @@ CREATE TABLE warehouse_tasks (
     priority integer NOT NULL DEFAULT 100,
 
     -- Stock-level directives
+    sku_id bigint REFERENCES stock_keeping_units(id) ON DELETE RESTRICT,
     pku_id bigint REFERENCES sku_packaging_units(id) ON DELETE RESTRICT,
     lot_id bigint REFERENCES lots(id) ON DELETE RESTRICT,
+    package_count numeric(12, 4) CHECK (package_count > 0),
     quantity numeric(12, 4) CHECK (quantity > 0),
 
     -- Container-level directives (e.g. moving an entire pallet)
