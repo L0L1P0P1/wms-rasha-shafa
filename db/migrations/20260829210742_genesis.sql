@@ -22,7 +22,6 @@ CREATE TABLE stock_keeping_units (
     id bigint 
         GENERATED ALWAYS AS IDENTITY (START WITH 10000) 
         PRIMARY KEY,
-    sku_code text COLLATE "C" NOT NULL UNIQUE,
     name text NOT NULL,
     base_uom uom NOT NULL DEFAULT 'EACH',
     is_discrete boolean NOT NULL DEFAULT true,

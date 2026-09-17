@@ -482,7 +482,6 @@ type SkuPackagingUnit struct {
 
 type StockKeepingUnit struct {
 	ID                  int64
-	SkuCode             string
 	Name                string
 	BaseUom             Uom
 	IsDiscrete          bool

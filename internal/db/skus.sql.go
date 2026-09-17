@@ -7,18 +7,544 @@ package db
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const getSomething = `-- name: GetSomething :one
-SELECT id, sku_code, name, base_uom, is_discrete, requires_lot_tracking, attributes, created_at FROM stock_keeping_units LIMIT 1
+const createLot = `-- name: CreateLot :one
+INSERT INTO lots (
+    sku_id,
+    lot_number,
+    status,
+    manufactured_at,
+    expires_at
+) VALUES (
+    $1, $2, $3, $4, $5
+)
+RETURNING id, sku_id, lot_number, status, manufactured_at, expires_at, received_at
 `
 
-func (q *Queries) GetSomething(ctx context.Context) (StockKeepingUnit, error) {
-	row := q.db.QueryRow(ctx, getSomething)
+type CreateLotParams struct {
+	SkuID          int64
+	LotNumber      string
+	Status         LotStatus
+	ManufacturedAt pgtype.Date
+	ExpiresAt      pgtype.Date
+}
+
+func (q *Queries) CreateLot(ctx context.Context, arg CreateLotParams) (Lot, error) {
+	row := q.db.QueryRow(ctx, createLot,
+		arg.SkuID,
+		arg.LotNumber,
+		arg.Status,
+		arg.ManufacturedAt,
+		arg.ExpiresAt,
+	)
+	var i Lot
+	err := row.Scan(
+		&i.ID,
+		&i.SkuID,
+		&i.LotNumber,
+		&i.Status,
+		&i.ManufacturedAt,
+		&i.ExpiresAt,
+		&i.ReceivedAt,
+	)
+	return i, err
+}
+
+const createPackagingUnit = `-- name: CreatePackagingUnit :one
+INSERT INTO sku_packaging_units (
+    sku_id,
+    unit_name,
+    conversion_factor,
+    parent_packaging_unit_id,
+    is_base_unit,
+    allows_break_bulk,
+    barcode,
+    tare_weight_kg,
+    gross_volume_cm3
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9
+)
+RETURNING id, sku_id, unit_name, conversion_factor, parent_packaging_unit_id, is_base_unit, allows_break_bulk, barcode, tare_weight_kg, gross_volume_cm3
+`
+
+type CreatePackagingUnitParams struct {
+	SkuID                 int64
+	UnitName              string
+	ConversionFactor      pgtype.Numeric
+	ParentPackagingUnitID pgtype.Int8
+	IsBaseUnit            bool
+	AllowsBreakBulk       bool
+	Barcode               pgtype.Text
+	TareWeightKg          pgtype.Numeric
+	GrossVolumeCm3        pgtype.Numeric
+}
+
+func (q *Queries) CreatePackagingUnit(ctx context.Context, arg CreatePackagingUnitParams) (SkuPackagingUnit, error) {
+	row := q.db.QueryRow(ctx, createPackagingUnit,
+		arg.SkuID,
+		arg.UnitName,
+		arg.ConversionFactor,
+		arg.ParentPackagingUnitID,
+		arg.IsBaseUnit,
+		arg.AllowsBreakBulk,
+		arg.Barcode,
+		arg.TareWeightKg,
+		arg.GrossVolumeCm3,
+	)
+	var i SkuPackagingUnit
+	err := row.Scan(
+		&i.ID,
+		&i.SkuID,
+		&i.UnitName,
+		&i.ConversionFactor,
+		&i.ParentPackagingUnitID,
+		&i.IsBaseUnit,
+		&i.AllowsBreakBulk,
+		&i.Barcode,
+		&i.TareWeightKg,
+		&i.GrossVolumeCm3,
+	)
+	return i, err
+}
+
+const createSKU = `-- name: CreateSKU :one
+INSERT INTO stock_keeping_units (
+    name,
+    base_uom,
+    is_discrete,
+    requires_lot_tracking,
+    attributes
+) VALUES (
+    $1, $2, $3, $4, $5
+)
+RETURNING id, name, base_uom, is_discrete, requires_lot_tracking, attributes, created_at
+`
+
+type CreateSKUParams struct {
+	Name                string
+	BaseUom             Uom
+	IsDiscrete          bool
+	RequiresLotTracking bool
+	Attributes          []byte
+}
+
+func (q *Queries) CreateSKU(ctx context.Context, arg CreateSKUParams) (StockKeepingUnit, error) {
+	row := q.db.QueryRow(ctx, createSKU,
+		arg.Name,
+		arg.BaseUom,
+		arg.IsDiscrete,
+		arg.RequiresLotTracking,
+		arg.Attributes,
+	)
 	var i StockKeepingUnit
 	err := row.Scan(
 		&i.ID,
-		&i.SkuCode,
+		&i.Name,
+		&i.BaseUom,
+		&i.IsDiscrete,
+		&i.RequiresLotTracking,
+		&i.Attributes,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const deletePackagingUnit = `-- name: DeletePackagingUnit :execrows
+DELETE FROM sku_packaging_units
+WHERE id = $1
+`
+
+func (q *Queries) DeletePackagingUnit(ctx context.Context, id int64) (int64, error) {
+	result, err := q.db.Exec(ctx, deletePackagingUnit, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteSKU = `-- name: DeleteSKU :execrows
+DELETE FROM stock_keeping_units
+WHERE id = $1
+`
+
+func (q *Queries) DeleteSKU(ctx context.Context, id int64) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteSKU, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const getLotByID = `-- name: GetLotByID :one
+SELECT id, sku_id, lot_number, status, manufactured_at, expires_at, received_at FROM lots
+WHERE id = $1 LIMIT 1
+`
+
+func (q *Queries) GetLotByID(ctx context.Context, id int64) (Lot, error) {
+	row := q.db.QueryRow(ctx, getLotByID, id)
+	var i Lot
+	err := row.Scan(
+		&i.ID,
+		&i.SkuID,
+		&i.LotNumber,
+		&i.Status,
+		&i.ManufacturedAt,
+		&i.ExpiresAt,
+		&i.ReceivedAt,
+	)
+	return i, err
+}
+
+const getLotBySKUAndNumber = `-- name: GetLotBySKUAndNumber :one
+SELECT id, sku_id, lot_number, status, manufactured_at, expires_at, received_at FROM lots
+WHERE sku_id = $1 AND lot_number = $2 LIMIT 1
+`
+
+type GetLotBySKUAndNumberParams struct {
+	SkuID     int64
+	LotNumber string
+}
+
+func (q *Queries) GetLotBySKUAndNumber(ctx context.Context, arg GetLotBySKUAndNumberParams) (Lot, error) {
+	row := q.db.QueryRow(ctx, getLotBySKUAndNumber, arg.SkuID, arg.LotNumber)
+	var i Lot
+	err := row.Scan(
+		&i.ID,
+		&i.SkuID,
+		&i.LotNumber,
+		&i.Status,
+		&i.ManufacturedAt,
+		&i.ExpiresAt,
+		&i.ReceivedAt,
+	)
+	return i, err
+}
+
+const getPackagingUnitByBarcode = `-- name: GetPackagingUnitByBarcode :one
+SELECT id, sku_id, unit_name, conversion_factor, parent_packaging_unit_id, is_base_unit, allows_break_bulk, barcode, tare_weight_kg, gross_volume_cm3 FROM sku_packaging_units
+WHERE barcode = $1 LIMIT 1
+`
+
+func (q *Queries) GetPackagingUnitByBarcode(ctx context.Context, barcode pgtype.Text) (SkuPackagingUnit, error) {
+	row := q.db.QueryRow(ctx, getPackagingUnitByBarcode, barcode)
+	var i SkuPackagingUnit
+	err := row.Scan(
+		&i.ID,
+		&i.SkuID,
+		&i.UnitName,
+		&i.ConversionFactor,
+		&i.ParentPackagingUnitID,
+		&i.IsBaseUnit,
+		&i.AllowsBreakBulk,
+		&i.Barcode,
+		&i.TareWeightKg,
+		&i.GrossVolumeCm3,
+	)
+	return i, err
+}
+
+const getPackagingUnitByID = `-- name: GetPackagingUnitByID :one
+SELECT id, sku_id, unit_name, conversion_factor, parent_packaging_unit_id, is_base_unit, allows_break_bulk, barcode, tare_weight_kg, gross_volume_cm3 FROM sku_packaging_units
+WHERE id = $1 LIMIT 1
+`
+
+func (q *Queries) GetPackagingUnitByID(ctx context.Context, id int64) (SkuPackagingUnit, error) {
+	row := q.db.QueryRow(ctx, getPackagingUnitByID, id)
+	var i SkuPackagingUnit
+	err := row.Scan(
+		&i.ID,
+		&i.SkuID,
+		&i.UnitName,
+		&i.ConversionFactor,
+		&i.ParentPackagingUnitID,
+		&i.IsBaseUnit,
+		&i.AllowsBreakBulk,
+		&i.Barcode,
+		&i.TareWeightKg,
+		&i.GrossVolumeCm3,
+	)
+	return i, err
+}
+
+const getSKUByID = `-- name: GetSKUByID :one
+SELECT id, name, base_uom, is_discrete, requires_lot_tracking, attributes, created_at FROM stock_keeping_units
+WHERE id = $1 LIMIT 1
+`
+
+func (q *Queries) GetSKUByID(ctx context.Context, id int64) (StockKeepingUnit, error) {
+	row := q.db.QueryRow(ctx, getSKUByID, id)
+	var i StockKeepingUnit
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.BaseUom,
+		&i.IsDiscrete,
+		&i.RequiresLotTracking,
+		&i.Attributes,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const listLotsBySKU = `-- name: ListLotsBySKU :many
+SELECT id, sku_id, lot_number, status, manufactured_at, expires_at, received_at FROM lots
+WHERE sku_id = $1
+ORDER BY expires_at ASC NULLS LAST
+`
+
+func (q *Queries) ListLotsBySKU(ctx context.Context, skuID int64) ([]Lot, error) {
+	rows, err := q.db.Query(ctx, listLotsBySKU, skuID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Lot
+	for rows.Next() {
+		var i Lot
+		if err := rows.Scan(
+			&i.ID,
+			&i.SkuID,
+			&i.LotNumber,
+			&i.Status,
+			&i.ManufacturedAt,
+			&i.ExpiresAt,
+			&i.ReceivedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPackagingUnitsBySKU = `-- name: ListPackagingUnitsBySKU :many
+SELECT id, sku_id, unit_name, conversion_factor, parent_packaging_unit_id, is_base_unit, allows_break_bulk, barcode, tare_weight_kg, gross_volume_cm3 FROM sku_packaging_units
+WHERE sku_id = $1
+ORDER BY conversion_factor ASC
+`
+
+func (q *Queries) ListPackagingUnitsBySKU(ctx context.Context, skuID int64) ([]SkuPackagingUnit, error) {
+	rows, err := q.db.Query(ctx, listPackagingUnitsBySKU, skuID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SkuPackagingUnit
+	for rows.Next() {
+		var i SkuPackagingUnit
+		if err := rows.Scan(
+			&i.ID,
+			&i.SkuID,
+			&i.UnitName,
+			&i.ConversionFactor,
+			&i.ParentPackagingUnitID,
+			&i.IsBaseUnit,
+			&i.AllowsBreakBulk,
+			&i.Barcode,
+			&i.TareWeightKg,
+			&i.GrossVolumeCm3,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSKUs = `-- name: ListSKUs :many
+SELECT id, name, base_uom, is_discrete, requires_lot_tracking, attributes, created_at FROM stock_keeping_units
+ORDER BY id
+LIMIT $1 OFFSET $2
+`
+
+type ListSKUsParams struct {
+	Limit  int32
+	Offset int32
+}
+
+func (q *Queries) ListSKUs(ctx context.Context, arg ListSKUsParams) ([]StockKeepingUnit, error) {
+	rows, err := q.db.Query(ctx, listSKUs, arg.Limit, arg.Offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []StockKeepingUnit
+	for rows.Next() {
+		var i StockKeepingUnit
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.BaseUom,
+			&i.IsDiscrete,
+			&i.RequiresLotTracking,
+			&i.Attributes,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const searchSKUsByName = `-- name: SearchSKUsByName :many
+SELECT id, name, base_uom, is_discrete, requires_lot_tracking, attributes, created_at FROM stock_keeping_units
+WHERE name % $1
+ORDER BY similarity(name, $1) DESC
+LIMIT $2
+`
+
+type SearchSKUsByNameParams struct {
+	Name  string
+	Limit int32
+}
+
+func (q *Queries) SearchSKUsByName(ctx context.Context, arg SearchSKUsByNameParams) ([]StockKeepingUnit, error) {
+	rows, err := q.db.Query(ctx, searchSKUsByName, arg.Name, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []StockKeepingUnit
+	for rows.Next() {
+		var i StockKeepingUnit
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.BaseUom,
+			&i.IsDiscrete,
+			&i.RequiresLotTracking,
+			&i.Attributes,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const updateLotStatus = `-- name: UpdateLotStatus :one
+UPDATE lots
+SET status = $2
+WHERE id = $1
+RETURNING id, sku_id, lot_number, status, manufactured_at, expires_at, received_at
+`
+
+type UpdateLotStatusParams struct {
+	ID     int64
+	Status LotStatus
+}
+
+func (q *Queries) UpdateLotStatus(ctx context.Context, arg UpdateLotStatusParams) (Lot, error) {
+	row := q.db.QueryRow(ctx, updateLotStatus, arg.ID, arg.Status)
+	var i Lot
+	err := row.Scan(
+		&i.ID,
+		&i.SkuID,
+		&i.LotNumber,
+		&i.Status,
+		&i.ManufacturedAt,
+		&i.ExpiresAt,
+		&i.ReceivedAt,
+	)
+	return i, err
+}
+
+const updatePackagingUnit = `-- name: UpdatePackagingUnit :one
+UPDATE sku_packaging_units
+SET
+    unit_name = COALESCE($1, unit_name),
+    conversion_factor = COALESCE($2, conversion_factor),
+    allows_break_bulk = COALESCE($3, allows_break_bulk),
+    barcode = COALESCE($4, barcode),
+    tare_weight_kg = COALESCE($5, tare_weight_kg),
+    gross_volume_cm3 = COALESCE($6, gross_volume_cm3)
+WHERE id = $7
+RETURNING id, sku_id, unit_name, conversion_factor, parent_packaging_unit_id, is_base_unit, allows_break_bulk, barcode, tare_weight_kg, gross_volume_cm3
+`
+
+type UpdatePackagingUnitParams struct {
+	UnitName         pgtype.Text
+	ConversionFactor pgtype.Numeric
+	AllowsBreakBulk  pgtype.Bool
+	Barcode          pgtype.Text
+	TareWeightKg     pgtype.Numeric
+	GrossVolumeCm3   pgtype.Numeric
+	ID               int64
+}
+
+func (q *Queries) UpdatePackagingUnit(ctx context.Context, arg UpdatePackagingUnitParams) (SkuPackagingUnit, error) {
+	row := q.db.QueryRow(ctx, updatePackagingUnit,
+		arg.UnitName,
+		arg.ConversionFactor,
+		arg.AllowsBreakBulk,
+		arg.Barcode,
+		arg.TareWeightKg,
+		arg.GrossVolumeCm3,
+		arg.ID,
+	)
+	var i SkuPackagingUnit
+	err := row.Scan(
+		&i.ID,
+		&i.SkuID,
+		&i.UnitName,
+		&i.ConversionFactor,
+		&i.ParentPackagingUnitID,
+		&i.IsBaseUnit,
+		&i.AllowsBreakBulk,
+		&i.Barcode,
+		&i.TareWeightKg,
+		&i.GrossVolumeCm3,
+	)
+	return i, err
+}
+
+const updateSKU = `-- name: UpdateSKU :one
+UPDATE stock_keeping_units
+SET
+    name = COALESCE($1, name),
+    is_discrete = COALESCE($2, is_discrete),
+    requires_lot_tracking = COALESCE($3, requires_lot_tracking),
+    attributes = COALESCE($4, attributes)
+WHERE id = $5
+RETURNING id, name, base_uom, is_discrete, requires_lot_tracking, attributes, created_at
+`
+
+type UpdateSKUParams struct {
+	Name                pgtype.Text
+	IsDiscrete          pgtype.Bool
+	RequiresLotTracking pgtype.Bool
+	Attributes          []byte
+	ID                  int64
+}
+
+func (q *Queries) UpdateSKU(ctx context.Context, arg UpdateSKUParams) (StockKeepingUnit, error) {
+	row := q.db.QueryRow(ctx, updateSKU,
+		arg.Name,
+		arg.IsDiscrete,
+		arg.RequiresLotTracking,
+		arg.Attributes,
+		arg.ID,
+	)
+	var i StockKeepingUnit
+	err := row.Scan(
+		&i.ID,
 		&i.Name,
 		&i.BaseUom,
 		&i.IsDiscrete,
