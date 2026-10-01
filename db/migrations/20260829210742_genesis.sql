@@ -151,7 +151,7 @@ CREATE TABLE inventory_balances (
     lot_id bigint,
 
     is_sealed boolean NOT NULL DEFAULT true,
-    package_count numeric(12, 4) NOT NULL DEFAULT 1 CHECK (package_count >= 0),
+    package_count numeric(12, 4) NOT NULL CHECK (package_count >= 0),
 
     -- Quantities always stored in the SKU's atomic base UOM
     on_hand numeric(12, 4) NOT NULL DEFAULT 0,
@@ -161,6 +161,8 @@ CREATE TABLE inventory_balances (
     CONSTRAINT chk_on_hand_positive CHECK (on_hand >= 0),
     CONSTRAINT chk_allocated_positive CHECK (allocated >= 0),
     CONSTRAINT chk_allocated_le_on_hand CHECK (allocated <= on_hand),
+    CONSTRAINT chk_unsealed_no_packages 
+      CHECK (is_sealed OR package_count = 0),
 
     -- Composite foreign keys prevent cross-SKU lot/PKU mixing
     CONSTRAINT fk_balance_pku 
@@ -173,14 +175,14 @@ CREATE TABLE inventory_balances (
         ON DELETE RESTRICT
 );
 
+ALTER TABLE inventory_balances SET (fillfactor = 70);
+
 -- Unique entry per Node + PKU + Lot + Sealed State
 CREATE UNIQUE INDEX uq_node_inventory 
     ON inventory_balances (node_id, pku_id, lot_id, is_sealed) NULLS NOT DISTINCT;
 
--- Fast index for reservation and picking engine
 CREATE INDEX idx_balances_reservable 
-    ON inventory_balances (sku_id, pku_id, is_sealed, lot_id, on_hand, allocated) 
-    WHERE (on_hand - allocated) > 0;
+    ON inventory_balances (sku_id, pku_id, is_sealed, lot_id);
 
 CREATE INDEX idx_balances_node ON inventory_balances (node_id);
 
@@ -244,9 +246,22 @@ CREATE TABLE inventory_allocations (
         REFERENCES inventory_balances(id) 
         ON DELETE RESTRICT,
     allocated_quantity numeric(12, 4) NOT NULL CHECK (allocated_quantity > 0),
+    picked_quantity numeric(12,4) NOT NULL DEFAULT 0 CHECK (picked_quantity >=0),
     created_at timestamptz NOT NULL DEFAULT now(),
 
-    CONSTRAINT uq_order_line_balance UNIQUE (order_line_id, balance_id)
+    CONSTRAINT fk_alloc_order_line 
+        FOREIGN KEY (order_line_id, sku_id) 
+        REFERENCES outbound_order_lines(id, sku_id) 
+        ON DELETE CASCADE,
+
+    -- Guarantees the allocation pulls from a balance of the SAME SKU
+    CONSTRAINT fk_alloc_balance 
+        FOREIGN KEY (balance_id, sku_id) 
+        REFERENCES inventory_balances(id, sku_id) 
+        ON DELETE RESTRICT,
+
+    CONSTRAINT uq_order_line_balance UNIQUE (order_line_id, balance_id),
+    CONSTRAINT chk_picked_le_allocated CHECK (picked_quantity <= allocated_quantity)
 );
 
 CREATE INDEX idx_allocations_order_line ON inventory_allocations (order_line_id);
@@ -278,7 +293,7 @@ CREATE TABLE inventory_movements (
         ON DELETE RESTRICT,
     pku_id bigint NOT NULL,
     lot_id bigint,
-    package_count numeric(12, 4) NOT NULL DEFAULT 1 CHECK (package_count >= 0),
+    package_count numeric(12, 4) NOT NULL CHECK (package_count >= 0),
     quantity numeric(12, 4) NOT NULL CHECK (quantity > 0),
 
     source_node_id bigint 
@@ -305,6 +320,13 @@ CREATE TABLE inventory_movements (
         FOREIGN KEY (lot_id, sku_id) 
         REFERENCES lots(id, sku_id) 
         ON DELETE RESTRICT,
+
+    CONSTRAINT chk_allocation_only_for_pick CHECK (
+        allocation_id IS NULL OR (reason = 'PICK' AND source_node_id IS NOT NULL)
+    ),
+
+    CONSTRAINT chk_unsealed_no_packages 
+      CHECK (is_sealed OR package_count = 0),
 
     CONSTRAINT chk_movement_endpoints CHECK (
         source_node_id IS NOT NULL OR destination_node_id IS NOT NULL
@@ -389,8 +411,8 @@ CREATE TABLE warehouse_tasks (
 
     -- Stock-level directives
     sku_id bigint REFERENCES stock_keeping_units(id) ON DELETE RESTRICT,
-    pku_id bigint REFERENCES sku_packaging_units(id) ON DELETE RESTRICT,
-    lot_id bigint REFERENCES lots(id) ON DELETE RESTRICT,
+    pku_id bigint,
+    lot_id bigint,
     package_count numeric(12, 4) CHECK (package_count > 0),
     quantity numeric(12, 4) CHECK (quantity > 0),
 
@@ -407,6 +429,13 @@ CREATE TABLE warehouse_tasks (
     created_at timestamptz NOT NULL DEFAULT now(),
     completed_at timestamptz,
 
+    CONSTRAINT fk_task_pku FOREIGN KEY (pku_id, sku_id)
+        REFERENCES sku_packaging_units(id, sku_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_task_lot FOREIGN KEY (lot_id, sku_id)
+        REFERENCES lots(id, sku_id) ON DELETE RESTRICT,
+    CONSTRAINT chk_task_sku_present CHECK (
+        (pku_id IS NULL AND lot_id IS NULL) OR sku_id IS NOT NULL
+    ),
     CONSTRAINT chk_task_payload CHECK (
         target_node_id IS NOT NULL OR (pku_id IS NOT NULL AND quantity IS NOT NULL)
     )
@@ -414,6 +443,19 @@ CREATE TABLE warehouse_tasks (
 
 CREATE INDEX idx_tasks_execution ON warehouse_tasks (status, priority DESC, created_at ASC);
 CREATE INDEX idx_tasks_operator ON warehouse_tasks (assigned_operator_id) WHERE assigned_operator_id IS NOT NULL;
+
+CREATE TABLE node_relocations (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    node_id bigint NOT NULL REFERENCES storage_nodes(id) ON DELETE RESTRICT,
+    from_parent_id bigint REFERENCES storage_nodes(id) ON DELETE RESTRICT,
+    to_parent_id bigint REFERENCES storage_nodes(id) ON DELETE RESTRICT,
+    from_path ltree NOT NULL,
+    to_path ltree NOT NULL,
+    operator_id text COLLATE "C" NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_relocations_node ON node_relocations (node_id, created_at DESC);
 
 -- ------------------------------------------------------------
 -- 7. ESSENTIAL DATABASE INTEGRITY TRIGGERS
@@ -521,7 +563,7 @@ EXECUTE FUNCTION update_storage_node_subtree_path();
 CREATE OR REPLACE FUNCTION prevent_movement_mutation()
 RETURNS TRIGGER AS $func$
 BEGIN
-    RAISE EXCEPTION 'Audit violation: inventory_movements is append-only and cannot be updated or deleted.';
+    RAISE EXCEPTION 'Audit violation: % is append-only and cannot be updated or deleted.', TG_TABLE_NAME;
 END;
 $func$ LANGUAGE plpgsql;
 -- +goose StatementEnd
@@ -531,7 +573,198 @@ BEFORE UPDATE OR DELETE ON inventory_movements
 FOR EACH ROW
 EXECUTE FUNCTION prevent_movement_mutation();
 
+CREATE TRIGGER trg_protect_inventory_movements_truncate
+BEFORE TRUNCATE ON inventory_movements
+FOR EACH STATEMENT
+EXECUTE FUNCTION prevent_movement_mutation();
+
+-- E. inventory_movemnt to balance trigger 
+
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION apply_inventory_movement()
+RETURNS TRIGGER AS $func$
+DECLARE
+    v_factor      numeric(12,4);
+    v_leg         record;
+    v_node        record;
+    v_balance_id  bigint;
+    v_release     numeric(12,4);
+    v_line_id     bigint;
+    v_line_factor numeric(12,4);
+BEGIN
+    SELECT conversion_factor INTO STRICT v_factor
+    FROM sku_packaging_units WHERE id = NEW.pku_id;
+
+    IF NEW.is_sealed AND NEW.quantity <> NEW.package_count * v_factor THEN
+        RAISE EXCEPTION 'Movement quantity % != package_count % * factor %',
+            NEW.quantity, NEW.package_count, v_factor;
+    END IF;
+
+    PERFORM set_config('wms.ledger_write', 'on', true);
+
+    FOR v_leg IN
+        SELECT node_id, delta_sign
+        FROM (VALUES (NEW.source_node_id, -1),
+                     (NEW.destination_node_id, 1)) AS t(node_id, delta_sign)
+        WHERE node_id IS NOT NULL
+        ORDER BY node_id
+    LOOP
+        -- #6: node must be able to hold stock
+        SELECT node_type, is_active INTO STRICT v_node
+        FROM storage_nodes WHERE id = v_leg.node_id
+        FOR SHARE;
+
+        IF v_node.node_type NOT IN ('BIN', 'PALLET', 'TOTE', 'CART') THEN
+            RAISE EXCEPTION 'Node % is a % and cannot hold stock',
+                v_leg.node_id, v_node.node_type;
+        END IF;
+
+        -- Inactive nodes may be emptied (source) but not filled (destination)
+        IF v_leg.delta_sign = 1 AND NOT v_node.is_active THEN
+            RAISE EXCEPTION 'Destination node % is inactive', v_leg.node_id;
+        END IF;
+
+        IF v_leg.delta_sign = 1 THEN
+            INSERT INTO inventory_balances AS ib
+                (node_id, sku_id, pku_id, lot_id, is_sealed, package_count, on_hand)
+            VALUES
+                (v_leg.node_id, NEW.sku_id, NEW.pku_id, NEW.lot_id,
+                 NEW.is_sealed, NEW.package_count, NEW.quantity)
+            ON CONFLICT (node_id, pku_id, lot_id, is_sealed)
+            DO UPDATE SET
+                on_hand       = ib.on_hand + EXCLUDED.on_hand,
+                package_count = ib.package_count + EXCLUDED.package_count,
+                updated_at    = now();
+        ELSE
+            v_release := CASE WHEN NEW.allocation_id IS NOT NULL
+                              THEN NEW.quantity ELSE 0 END;
+
+            UPDATE inventory_balances
+            SET on_hand       = on_hand - NEW.quantity,
+                package_count = package_count - NEW.package_count,
+                allocated     = allocated - v_release,
+                updated_at    = now()
+            WHERE node_id = v_leg.node_id
+              AND pku_id = NEW.pku_id
+              AND is_sealed = NEW.is_sealed
+              AND lot_id IS NOT DISTINCT FROM NEW.lot_id
+            RETURNING id INTO v_balance_id;
+
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'No balance at node % for pku % lot % sealed=%',
+                    v_leg.node_id, NEW.pku_id, NEW.lot_id, NEW.is_sealed;
+            END IF;
+
+            -- #2: consume the allocation and advance the order line
+            IF NEW.allocation_id IS NOT NULL THEN
+                UPDATE inventory_allocations
+                SET picked_quantity = picked_quantity + NEW.quantity
+                WHERE id = NEW.allocation_id
+                  AND balance_id = v_balance_id
+                RETURNING order_line_id INTO v_line_id;
+
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'Allocation % does not belong to the source balance',
+                        NEW.allocation_id;
+                END IF;
+
+                -- Line quantities are in the line's PKU; movement quantity is base UOM
+                SELECT pu.conversion_factor INTO STRICT v_line_factor
+                FROM outbound_order_lines l
+                JOIN sku_packaging_units pu ON pu.id = l.pku_id
+                WHERE l.id = v_line_id;
+
+                UPDATE outbound_order_lines
+                SET fulfilled_quantity = fulfilled_quantity + NEW.quantity / v_line_factor
+                WHERE id = v_line_id;
+            END IF;
+        END IF;
+    END LOOP;
+
+    PERFORM set_config('wms.ledger_write', 'off', true);
+    RETURN NULL;
+END;
+$func$ LANGUAGE plpgsql;
+-- +goose StatementEnd
+
+CREATE TRIGGER trg_apply_inventory_movement
+AFTER INSERT ON inventory_movements
+FOR EACH ROW
+EXECUTE FUNCTION apply_inventory_movement();
+
+-- F. Immutability guards
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION guard_balance_ledger_columns()
+RETURNS TRIGGER AS $func$
+BEGIN
+    IF current_setting('wms.ledger_write', true) IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION 'on_hand/package_count may only change via inventory_movements';
+    END IF;
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$func$ LANGUAGE plpgsql;
+-- +goose StatementEnd
+
+CREATE TRIGGER trg_guard_balance_ins BEFORE INSERT ON inventory_balances
+FOR EACH ROW EXECUTE FUNCTION guard_balance_ledger_columns();
+
+CREATE TRIGGER trg_guard_balance_upd BEFORE UPDATE ON inventory_balances
+FOR EACH ROW
+WHEN (OLD.on_hand IS DISTINCT FROM NEW.on_hand
+   OR OLD.package_count IS DISTINCT FROM NEW.package_count)
+EXECUTE FUNCTION guard_balance_ledger_columns();
+
+CREATE TRIGGER trg_guard_balance_del BEFORE DELETE ON inventory_balances
+FOR EACH ROW WHEN (OLD.on_hand <> 0)
+EXECUTE FUNCTION guard_balance_ledger_columns();
+
+-- G. node relocation
+
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION log_node_relocation()
+RETURNS TRIGGER AS $func$
+BEGIN
+    INSERT INTO node_relocations
+        (node_id, from_parent_id, to_parent_id, from_path, to_path, operator_id)
+    VALUES
+        (NEW.id, OLD.parent_id, NEW.parent_id, OLD.path, NEW.path,
+         COALESCE(NULLIF(current_setting('wms.operator_id', true), ''), session_user));
+    RETURN NULL;
+END;
+$func$ LANGUAGE plpgsql;
+-- +goose StatementEnd
+
+-- Fires only on the moved node; descendants change path, not parent_id
+CREATE TRIGGER trg_log_node_relocation
+AFTER UPDATE OF parent_id ON storage_nodes
+FOR EACH ROW
+WHEN (OLD.parent_id IS DISTINCT FROM NEW.parent_id)
+EXECUTE FUNCTION log_node_relocation();
+
+CREATE TRIGGER trg_protect_node_relocations
+BEFORE UPDATE OR DELETE ON node_relocations
+FOR EACH ROW EXECUTE FUNCTION prevent_movement_mutation();
+
+CREATE TRIGGER trg_protect_node_relocations_truncate
+BEFORE TRUNCATE ON node_relocations
+FOR EACH STATEMENT EXECUTE FUNCTION prevent_movement_mutation();
+
 -- +goose Down
+DROP TRIGGER IF EXISTS trg_protect_node_relocations_truncate ON node_relocations;
+DROP TRIGGER IF EXISTS trg_protect_node_relocations ON node_relocations;
+DROP TRIGGER IF EXISTS trg_log_node_relocation ON storage_nodes;
+DROP FUNCTION IF EXISTS log_node_relocation();
+
+DROP TRIGGER IF EXISTS trg_guard_balance_del ON inventory_balances;
+DROP TRIGGER IF EXISTS trg_guard_balance_upd ON inventory_balances;
+DROP TRIGGER IF EXISTS trg_guard_balance_ins ON inventory_balances;
+DROP FUNCTION IF EXISTS guard_balance_ledger_columns();
+
+DROP TRIGGER IF EXISTS trg_apply_inventory_movement ON inventory_movements;
+DROP FUNCTION IF EXISTS apply_inventory_movement();
+
+DROP TRIGGER IF EXISTS trg_protect_inventory_movements_truncate ON inventory_movements;
 DROP TRIGGER IF EXISTS trg_protect_inventory_movements ON inventory_movements;
 DROP FUNCTION IF EXISTS prevent_movement_mutation();
 
@@ -544,6 +777,7 @@ DROP FUNCTION IF EXISTS update_storage_node_parent_change();
 DROP TRIGGER IF EXISTS trg_set_storage_node_path ON storage_nodes;
 DROP FUNCTION IF EXISTS set_storage_node_path();
 
+DROP TABLE IF EXISTS node_relocations;
 DROP TABLE IF EXISTS warehouse_tasks;
 DROP TYPE IF EXISTS task_status;
 DROP TYPE IF EXISTS task_type;
