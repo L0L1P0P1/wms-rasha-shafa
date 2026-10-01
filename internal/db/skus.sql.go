@@ -120,7 +120,7 @@ INSERT INTO stock_keeping_units (
 ) VALUES (
     $1, $2, $3, $4, $5
 )
-RETURNING id, name, base_uom, is_discrete, requires_lot_tracking, attributes, created_at
+RETURNING id, name, base_uom, is_discrete, requires_lot_tracking, tenant_id, attributes, created_at
 `
 
 type CreateSKUParams struct {
@@ -146,6 +146,7 @@ func (q *Queries) CreateSKU(ctx context.Context, arg CreateSKUParams) (StockKeep
 		&i.BaseUom,
 		&i.IsDiscrete,
 		&i.RequiresLotTracking,
+		&i.TenantID,
 		&i.Attributes,
 		&i.CreatedAt,
 	)
@@ -270,7 +271,7 @@ func (q *Queries) GetPackagingUnitByID(ctx context.Context, id int64) (SkuPackag
 }
 
 const getSKUByID = `-- name: GetSKUByID :one
-SELECT id, name, base_uom, is_discrete, requires_lot_tracking, attributes, created_at FROM stock_keeping_units
+SELECT id, name, base_uom, is_discrete, requires_lot_tracking, tenant_id, attributes, created_at FROM stock_keeping_units
 WHERE id = $1 LIMIT 1
 `
 
@@ -283,6 +284,7 @@ func (q *Queries) GetSKUByID(ctx context.Context, id int64) (StockKeepingUnit, e
 		&i.BaseUom,
 		&i.IsDiscrete,
 		&i.RequiresLotTracking,
+		&i.TenantID,
 		&i.Attributes,
 		&i.CreatedAt,
 	)
@@ -361,7 +363,7 @@ func (q *Queries) ListPackagingUnitsBySKU(ctx context.Context, skuID int64) ([]S
 }
 
 const listSKUs = `-- name: ListSKUs :many
-SELECT id, name, base_uom, is_discrete, requires_lot_tracking, attributes, created_at FROM stock_keeping_units
+SELECT id, name, base_uom, is_discrete, requires_lot_tracking, tenant_id, attributes, created_at FROM stock_keeping_units
 ORDER BY id
 LIMIT $1 OFFSET $2
 `
@@ -386,6 +388,7 @@ func (q *Queries) ListSKUs(ctx context.Context, arg ListSKUsParams) ([]StockKeep
 			&i.BaseUom,
 			&i.IsDiscrete,
 			&i.RequiresLotTracking,
+			&i.TenantID,
 			&i.Attributes,
 			&i.CreatedAt,
 		); err != nil {
@@ -400,7 +403,7 @@ func (q *Queries) ListSKUs(ctx context.Context, arg ListSKUsParams) ([]StockKeep
 }
 
 const searchSKUsByName = `-- name: SearchSKUsByName :many
-SELECT id, name, base_uom, is_discrete, requires_lot_tracking, attributes, created_at FROM stock_keeping_units
+SELECT id, name, base_uom, is_discrete, requires_lot_tracking, tenant_id, attributes, created_at FROM stock_keeping_units
 WHERE name % $1
 ORDER BY similarity(name, $1) DESC
 LIMIT $2
@@ -426,6 +429,7 @@ func (q *Queries) SearchSKUsByName(ctx context.Context, arg SearchSKUsByNamePara
 			&i.BaseUom,
 			&i.IsDiscrete,
 			&i.RequiresLotTracking,
+			&i.TenantID,
 			&i.Attributes,
 			&i.CreatedAt,
 		); err != nil {
@@ -523,7 +527,7 @@ SET
     requires_lot_tracking = COALESCE($3, requires_lot_tracking),
     attributes = COALESCE($4, attributes)
 WHERE id = $5
-RETURNING id, name, base_uom, is_discrete, requires_lot_tracking, attributes, created_at
+RETURNING id, name, base_uom, is_discrete, requires_lot_tracking, tenant_id, attributes, created_at
 `
 
 type UpdateSKUParams struct {
@@ -549,6 +553,7 @@ func (q *Queries) UpdateSKU(ctx context.Context, arg UpdateSKUParams) (StockKeep
 		&i.BaseUom,
 		&i.IsDiscrete,
 		&i.RequiresLotTracking,
+		&i.TenantID,
 		&i.Attributes,
 		&i.CreatedAt,
 	)

@@ -11,99 +11,41 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const applyBalanceAllocation = `-- name: ApplyBalanceAllocation :one
-UPDATE inventory_balances
-SET
-    allocated = allocated + $2,
-    updated_at = now()
-WHERE id = $1 AND (on_hand - allocated) >= $2
-RETURNING id, node_id, sku_id, pku_id, lot_id, is_sealed, package_count, on_hand, allocated, updated_at
-`
-
-type ApplyBalanceAllocationParams struct {
-	ID        int64
-	Allocated pgtype.Numeric
-}
-
-func (q *Queries) ApplyBalanceAllocation(ctx context.Context, arg ApplyBalanceAllocationParams) (InventoryBalance, error) {
-	row := q.db.QueryRow(ctx, applyBalanceAllocation, arg.ID, arg.Allocated)
-	var i InventoryBalance
-	err := row.Scan(
-		&i.ID,
-		&i.NodeID,
-		&i.SkuID,
-		&i.PkuID,
-		&i.LotID,
-		&i.IsSealed,
-		&i.PackageCount,
-		&i.OnHand,
-		&i.Allocated,
-		&i.UpdatedAt,
-	)
-	return i, err
-}
-
 const createAllocation = `-- name: CreateAllocation :one
 INSERT INTO inventory_allocations (
     order_line_id,
     balance_id,
+    sku_id,
     allocated_quantity
 ) VALUES (
-    $1, $2, $3
+    $1, $2, $3, $4
 )
-RETURNING id, order_line_id, balance_id, allocated_quantity, created_at
+RETURNING id, order_line_id, balance_id, sku_id, allocated_quantity, picked_quantity, created_at
 `
 
 type CreateAllocationParams struct {
 	OrderLineID       int64
 	BalanceID         int64
+	SkuID             int64
 	AllocatedQuantity pgtype.Numeric
 }
 
 func (q *Queries) CreateAllocation(ctx context.Context, arg CreateAllocationParams) (InventoryAllocation, error) {
-	row := q.db.QueryRow(ctx, createAllocation, arg.OrderLineID, arg.BalanceID, arg.AllocatedQuantity)
+	row := q.db.QueryRow(ctx, createAllocation,
+		arg.OrderLineID,
+		arg.BalanceID,
+		arg.SkuID,
+		arg.AllocatedQuantity,
+	)
 	var i InventoryAllocation
 	err := row.Scan(
 		&i.ID,
 		&i.OrderLineID,
 		&i.BalanceID,
-		&i.AllocatedQuantity,
-		&i.CreatedAt,
-	)
-	return i, err
-}
-
-const deductBalanceFulfillment = `-- name: DeductBalanceFulfillment :one
-UPDATE inventory_balances
-SET
-    on_hand = on_hand - $2,
-    allocated = allocated - $2,
-    package_count = GREATEST(0, package_count - $3),
-    updated_at = now()
-WHERE id = $1 AND allocated >= $2 AND on_hand >= $2
-RETURNING id, node_id, sku_id, pku_id, lot_id, is_sealed, package_count, on_hand, allocated, updated_at
-`
-
-type DeductBalanceFulfillmentParams struct {
-	ID           int64
-	OnHand       pgtype.Numeric
-	PackageCount pgtype.Numeric
-}
-
-func (q *Queries) DeductBalanceFulfillment(ctx context.Context, arg DeductBalanceFulfillmentParams) (InventoryBalance, error) {
-	row := q.db.QueryRow(ctx, deductBalanceFulfillment, arg.ID, arg.OnHand, arg.PackageCount)
-	var i InventoryBalance
-	err := row.Scan(
-		&i.ID,
-		&i.NodeID,
 		&i.SkuID,
-		&i.PkuID,
-		&i.LotID,
-		&i.IsSealed,
-		&i.PackageCount,
-		&i.OnHand,
-		&i.Allocated,
-		&i.UpdatedAt,
+		&i.AllocatedQuantity,
+		&i.PickedQuantity,
+		&i.CreatedAt,
 	)
 	return i, err
 }
@@ -122,7 +64,7 @@ func (q *Queries) DeleteAllocation(ctx context.Context, id int64) (int64, error)
 }
 
 const findReservableBalances = `-- name: FindReservableBalances :many
-SELECT b.id, b.node_id, b.sku_id, b.pku_id, b.lot_id, b.is_sealed, b.package_count, b.on_hand, b.allocated, b.updated_at
+SELECT b.id, b.node_id, b.sku_id, b.pku_id, b.lot_id, b.is_sealed, b.package_count, b.version, b.on_hand, b.allocated, b.updated_at
 FROM inventory_balances b
 LEFT JOIN lots l ON b.lot_id = l.id
 WHERE b.sku_id = $1
@@ -155,6 +97,7 @@ func (q *Queries) FindReservableBalances(ctx context.Context, arg FindReservable
 			&i.LotID,
 			&i.IsSealed,
 			&i.PackageCount,
+			&i.Version,
 			&i.OnHand,
 			&i.Allocated,
 			&i.UpdatedAt,
@@ -170,7 +113,7 @@ func (q *Queries) FindReservableBalances(ctx context.Context, arg FindReservable
 }
 
 const getAllocationsByOrderLine = `-- name: GetAllocationsByOrderLine :many
-SELECT id, order_line_id, balance_id, allocated_quantity, created_at FROM inventory_allocations
+SELECT id, order_line_id, balance_id, sku_id, allocated_quantity, picked_quantity, created_at FROM inventory_allocations
 WHERE order_line_id = $1
 `
 
@@ -187,7 +130,9 @@ func (q *Queries) GetAllocationsByOrderLine(ctx context.Context, orderLineID int
 			&i.ID,
 			&i.OrderLineID,
 			&i.BalanceID,
+			&i.SkuID,
 			&i.AllocatedQuantity,
+			&i.PickedQuantity,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -200,55 +145,105 @@ func (q *Queries) GetAllocationsByOrderLine(ctx context.Context, orderLineID int
 	return items, nil
 }
 
-const getBalanceForUpdate = `-- name: GetBalanceForUpdate :one
-SELECT id, node_id, sku_id, pku_id, lot_id, is_sealed, package_count, on_hand, allocated, updated_at FROM inventory_balances
-WHERE id = $1
-FOR UPDATE
+const incrementAllocationPicked = `-- name: IncrementAllocationPicked :one
+UPDATE inventory_allocations
+SET picked_quantity = picked_quantity + $2
+WHERE id = $1 AND (picked_quantity + $2) <= allocated_quantity
+RETURNING id, order_line_id, balance_id, sku_id, allocated_quantity, picked_quantity, created_at
 `
 
-func (q *Queries) GetBalanceForUpdate(ctx context.Context, id int64) (InventoryBalance, error) {
-	row := q.db.QueryRow(ctx, getBalanceForUpdate, id)
-	var i InventoryBalance
+type IncrementAllocationPickedParams struct {
+	ID             int64
+	PickedQuantity pgtype.Numeric
+}
+
+func (q *Queries) IncrementAllocationPicked(ctx context.Context, arg IncrementAllocationPickedParams) (InventoryAllocation, error) {
+	row := q.db.QueryRow(ctx, incrementAllocationPicked, arg.ID, arg.PickedQuantity)
+	var i InventoryAllocation
 	err := row.Scan(
 		&i.ID,
-		&i.NodeID,
+		&i.OrderLineID,
+		&i.BalanceID,
 		&i.SkuID,
-		&i.PkuID,
-		&i.LotID,
-		&i.IsSealed,
-		&i.PackageCount,
-		&i.OnHand,
-		&i.Allocated,
-		&i.UpdatedAt,
+		&i.AllocatedQuantity,
+		&i.PickedQuantity,
+		&i.CreatedAt,
 	)
 	return i, err
 }
 
-const getInventoryBalanceByID = `-- name: GetInventoryBalanceByID :one
-SELECT id, node_id, sku_id, pku_id, lot_id, is_sealed, package_count, on_hand, allocated, updated_at FROM inventory_balances
-WHERE id = $1 LIMIT 1
+const insertMovement = `-- name: InsertMovement :one
+INSERT INTO inventory_movements (
+    sku_id,
+    pku_id,
+    lot_id,
+    package_count,
+    quantity,
+    source_node_id,
+    destination_node_id,
+    reason,
+    reference_id,
+    allocation_id,
+    is_sealed,
+    operator_id
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+)
+RETURNING id, sku_id, pku_id, lot_id, package_count, quantity, source_node_id, destination_node_id, reason, reference_id, allocation_id, is_sealed, operator_id, created_at
 `
 
-func (q *Queries) GetInventoryBalanceByID(ctx context.Context, id int64) (InventoryBalance, error) {
-	row := q.db.QueryRow(ctx, getInventoryBalanceByID, id)
-	var i InventoryBalance
+type InsertMovementParams struct {
+	SkuID             int64
+	PkuID             int64
+	LotID             pgtype.Int8
+	PackageCount      pgtype.Numeric
+	Quantity          pgtype.Numeric
+	SourceNodeID      pgtype.Int8
+	DestinationNodeID pgtype.Int8
+	Reason            MovementReason
+	ReferenceID       pgtype.Text
+	AllocationID      pgtype.Int8
+	IsSealed          bool
+	OperatorID        string
+}
+
+func (q *Queries) InsertMovement(ctx context.Context, arg InsertMovementParams) (InventoryMovement, error) {
+	row := q.db.QueryRow(ctx, insertMovement,
+		arg.SkuID,
+		arg.PkuID,
+		arg.LotID,
+		arg.PackageCount,
+		arg.Quantity,
+		arg.SourceNodeID,
+		arg.DestinationNodeID,
+		arg.Reason,
+		arg.ReferenceID,
+		arg.AllocationID,
+		arg.IsSealed,
+		arg.OperatorID,
+	)
+	var i InventoryMovement
 	err := row.Scan(
 		&i.ID,
-		&i.NodeID,
 		&i.SkuID,
 		&i.PkuID,
 		&i.LotID,
-		&i.IsSealed,
 		&i.PackageCount,
-		&i.OnHand,
-		&i.Allocated,
-		&i.UpdatedAt,
+		&i.Quantity,
+		&i.SourceNodeID,
+		&i.DestinationNodeID,
+		&i.Reason,
+		&i.ReferenceID,
+		&i.AllocationID,
+		&i.IsSealed,
+		&i.OperatorID,
+		&i.CreatedAt,
 	)
 	return i, err
 }
 
 const listBalancesByNode = `-- name: ListBalancesByNode :many
-SELECT b.id, b.node_id, b.sku_id, b.pku_id, b.lot_id, b.is_sealed, b.package_count, b.on_hand, b.allocated, b.updated_at, s.id, s.name AS sku_name, p.unit_name
+SELECT b.id, b.node_id, b.sku_id, b.pku_id, b.lot_id, b.is_sealed, b.package_count, b.version, b.on_hand, b.allocated, b.updated_at, s.id AS sku_uuid, s.name AS sku_name, p.unit_name
 FROM inventory_balances b
 JOIN stock_keeping_units s ON b.sku_id = s.id
 JOIN sku_packaging_units p ON b.pku_id = p.id
@@ -263,10 +258,11 @@ type ListBalancesByNodeRow struct {
 	LotID        pgtype.Int8
 	IsSealed     bool
 	PackageCount pgtype.Numeric
+	Version      int32
 	OnHand       pgtype.Numeric
 	Allocated    pgtype.Numeric
 	UpdatedAt    pgtype.Timestamptz
-	ID_2         int64
+	SkuUuid      int64
 	SkuName      string
 	UnitName     string
 }
@@ -288,10 +284,11 @@ func (q *Queries) ListBalancesByNode(ctx context.Context, nodeID int64) ([]ListB
 			&i.LotID,
 			&i.IsSealed,
 			&i.PackageCount,
+			&i.Version,
 			&i.OnHand,
 			&i.Allocated,
 			&i.UpdatedAt,
-			&i.ID_2,
+			&i.SkuUuid,
 			&i.SkuName,
 			&i.UnitName,
 		); err != nil {
@@ -401,161 +398,131 @@ func (q *Queries) ListMovementsBySKU(ctx context.Context, arg ListMovementsBySKU
 	return items, nil
 }
 
-const recordMovement = `-- name: RecordMovement :one
-INSERT INTO inventory_movements (
-    sku_id,
-    pku_id,
-    lot_id,
-    package_count,
-    quantity,
-    source_node_id,
-    destination_node_id,
-    reason,
-    reference_id,
-    allocation_id,
-    is_sealed,
-    operator_id
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-)
-RETURNING id, sku_id, pku_id, lot_id, package_count, quantity, source_node_id, destination_node_id, reason, reference_id, allocation_id, is_sealed, operator_id, created_at
+const lockBalanceForUpdate = `-- name: LockBalanceForUpdate :one
+SELECT id, on_hand, package_count, allocated, version 
+FROM inventory_balances 
+WHERE node_id = $1 AND pku_id = $2 
+  AND lot_id IS NOT DISTINCT FROM $3 AND is_sealed = $4
+FOR UPDATE
 `
 
-type RecordMovementParams struct {
-	SkuID             int64
-	PkuID             int64
-	LotID             pgtype.Int8
-	PackageCount      pgtype.Numeric
-	Quantity          pgtype.Numeric
-	SourceNodeID      pgtype.Int8
-	DestinationNodeID pgtype.Int8
-	Reason            MovementReason
-	ReferenceID       pgtype.Text
-	AllocationID      pgtype.Int8
-	IsSealed          bool
-	OperatorID        string
+type LockBalanceForUpdateParams struct {
+	NodeID   int64
+	PkuID    int64
+	LotID    pgtype.Int8
+	IsSealed bool
 }
 
-func (q *Queries) RecordMovement(ctx context.Context, arg RecordMovementParams) (InventoryMovement, error) {
-	row := q.db.QueryRow(ctx, recordMovement,
-		arg.SkuID,
+type LockBalanceForUpdateRow struct {
+	ID           int64
+	OnHand       pgtype.Numeric
+	PackageCount pgtype.Numeric
+	Allocated    pgtype.Numeric
+	Version      int32
+}
+
+func (q *Queries) LockBalanceForUpdate(ctx context.Context, arg LockBalanceForUpdateParams) (LockBalanceForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, lockBalanceForUpdate,
+		arg.NodeID,
 		arg.PkuID,
 		arg.LotID,
-		arg.PackageCount,
-		arg.Quantity,
-		arg.SourceNodeID,
-		arg.DestinationNodeID,
-		arg.Reason,
-		arg.ReferenceID,
-		arg.AllocationID,
 		arg.IsSealed,
-		arg.OperatorID,
 	)
-	var i InventoryMovement
+	var i LockBalanceForUpdateRow
 	err := row.Scan(
 		&i.ID,
-		&i.SkuID,
-		&i.PkuID,
-		&i.LotID,
-		&i.PackageCount,
-		&i.Quantity,
-		&i.SourceNodeID,
-		&i.DestinationNodeID,
-		&i.Reason,
-		&i.ReferenceID,
-		&i.AllocationID,
-		&i.IsSealed,
-		&i.OperatorID,
-		&i.CreatedAt,
-	)
-	return i, err
-}
-
-const releaseBalanceAllocation = `-- name: ReleaseBalanceAllocation :one
-UPDATE inventory_balances
-SET
-    allocated = allocated - $2,
-    updated_at = now()
-WHERE id = $1 AND allocated >= $2
-RETURNING id, node_id, sku_id, pku_id, lot_id, is_sealed, package_count, on_hand, allocated, updated_at
-`
-
-type ReleaseBalanceAllocationParams struct {
-	ID        int64
-	Allocated pgtype.Numeric
-}
-
-func (q *Queries) ReleaseBalanceAllocation(ctx context.Context, arg ReleaseBalanceAllocationParams) (InventoryBalance, error) {
-	row := q.db.QueryRow(ctx, releaseBalanceAllocation, arg.ID, arg.Allocated)
-	var i InventoryBalance
-	err := row.Scan(
-		&i.ID,
-		&i.NodeID,
-		&i.SkuID,
-		&i.PkuID,
-		&i.LotID,
-		&i.IsSealed,
-		&i.PackageCount,
 		&i.OnHand,
+		&i.PackageCount,
 		&i.Allocated,
-		&i.UpdatedAt,
+		&i.Version,
 	)
 	return i, err
 }
 
-const upsertInventoryBalance = `-- name: UpsertInventoryBalance :one
+const projectDestinationAddition = `-- name: ProjectDestinationAddition :exec
 INSERT INTO inventory_balances (
-    node_id,
-    sku_id,
-    pku_id,
-    lot_id,
-    is_sealed,
-    package_count,
-    on_hand,
-    allocated
+    node_id, sku_id, pku_id, lot_id, is_sealed, on_hand, package_count
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, 0
+    $1, $2, $3, $4, $5, $6, $7
 )
-ON CONFLICT (node_id, pku_id, lot_id, is_sealed)
-DO UPDATE SET
-    package_count = inventory_balances.package_count + EXCLUDED.package_count,
+ON CONFLICT (node_id, pku_id, lot_id, is_sealed) 
+DO UPDATE SET 
     on_hand = inventory_balances.on_hand + EXCLUDED.on_hand,
+    package_count = inventory_balances.package_count + EXCLUDED.package_count,
+    version = inventory_balances.version + 1,
     updated_at = now()
-RETURNING id, node_id, sku_id, pku_id, lot_id, is_sealed, package_count, on_hand, allocated, updated_at
 `
 
-type UpsertInventoryBalanceParams struct {
+type ProjectDestinationAdditionParams struct {
 	NodeID       int64
 	SkuID        int64
 	PkuID        int64
 	LotID        pgtype.Int8
 	IsSealed     bool
-	PackageCount pgtype.Numeric
 	OnHand       pgtype.Numeric
+	PackageCount pgtype.Numeric
 }
 
-func (q *Queries) UpsertInventoryBalance(ctx context.Context, arg UpsertInventoryBalanceParams) (InventoryBalance, error) {
-	row := q.db.QueryRow(ctx, upsertInventoryBalance,
+func (q *Queries) ProjectDestinationAddition(ctx context.Context, arg ProjectDestinationAdditionParams) error {
+	_, err := q.db.Exec(ctx, projectDestinationAddition,
 		arg.NodeID,
 		arg.SkuID,
 		arg.PkuID,
 		arg.LotID,
 		arg.IsSealed,
-		arg.PackageCount,
 		arg.OnHand,
+		arg.PackageCount,
 	)
-	var i InventoryBalance
-	err := row.Scan(
-		&i.ID,
-		&i.NodeID,
-		&i.SkuID,
-		&i.PkuID,
-		&i.LotID,
-		&i.IsSealed,
-		&i.PackageCount,
-		&i.OnHand,
-		&i.Allocated,
-		&i.UpdatedAt,
+	return err
+}
+
+const projectSourceDeduction = `-- name: ProjectSourceDeduction :execrows
+UPDATE inventory_balances
+SET on_hand = on_hand - $1, 
+    package_count = package_count - $2, 
+    version = version + 1,
+    updated_at = now()
+WHERE id = $3 AND version = $4
+`
+
+type ProjectSourceDeductionParams struct {
+	OnHand       pgtype.Numeric
+	PackageCount pgtype.Numeric
+	ID           int64
+	Version      int32
+}
+
+func (q *Queries) ProjectSourceDeduction(ctx context.Context, arg ProjectSourceDeductionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, projectSourceDeduction,
+		arg.OnHand,
+		arg.PackageCount,
+		arg.ID,
+		arg.Version,
 	)
-	return i, err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateBalanceAllocation = `-- name: UpdateBalanceAllocation :execrows
+UPDATE inventory_balances
+SET allocated = allocated + $1,
+    version = version + 1,
+    updated_at = now()
+WHERE id = $2 AND version = $3 AND (on_hand - allocated - $1) >= 0
+`
+
+type UpdateBalanceAllocationParams struct {
+	Allocated pgtype.Numeric
+	ID        int64
+	Version   int32
+}
+
+func (q *Queries) UpdateBalanceAllocation(ctx context.Context, arg UpdateBalanceAllocationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateBalanceAllocation, arg.Allocated, arg.ID, arg.Version)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

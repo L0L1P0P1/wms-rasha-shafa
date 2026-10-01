@@ -176,7 +176,9 @@ CREATE TABLE inventory_balances (
     CONSTRAINT fk_balance_lot 
         FOREIGN KEY (lot_id, sku_id) 
         REFERENCES lots(id, sku_id) 
-        ON DELETE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT uq_balance_id_sku UNIQUE (id, sku_id)
 );
 
 ALTER TABLE inventory_balances SET (fillfactor = 70);
@@ -208,6 +210,7 @@ CREATE TABLE outbound_orders (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id bigint,
     order_number text COLLATE "C" NOT NULL UNIQUE,
+    version integer NOT NULL DEFAULT 1,
     customer_name text,
     status order_status NOT NULL DEFAULT 'PENDING',
     priority integer NOT NULL DEFAULT 100,
@@ -235,6 +238,7 @@ CREATE TABLE outbound_order_lines (
         REFERENCES sku_packaging_units(id, sku_id) 
         ON DELETE RESTRICT,
     CONSTRAINT uq_order_line_pku UNIQUE (order_id, pku_id),
+    CONSTRAINT uq_order_line_id_sku UNIQUE (id, sku_id),
     CONSTRAINT chk_fulfillment_bounds CHECK (fulfilled_quantity <= requested_quantity)
 );
 
@@ -244,12 +248,11 @@ CREATE INDEX idx_order_lines_pku ON outbound_order_lines (pku_id);
 
 CREATE TABLE inventory_allocations (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    order_line_id bigint NOT NULL 
-        REFERENCES outbound_order_lines(id) 
-        ON DELETE CASCADE,
-    balance_id bigint NOT NULL 
-        REFERENCES inventory_balances(id) 
-        ON DELETE RESTRICT,
+
+    order_line_id bigint NOT NULL,
+    balance_id bigint NOT NULL,
+    sku_id bigint NOT NULL,
+
     allocated_quantity numeric(12, 4) NOT NULL CHECK (allocated_quantity > 0),
     picked_quantity numeric(12,4) NOT NULL DEFAULT 0 CHECK (picked_quantity >=0),
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -365,6 +368,7 @@ CREATE TABLE inbound_orders (
     po_number text COLLATE "C" NOT NULL UNIQUE,
     tenant_id bigint,
     vendor_name text NOT NULL,
+    version integer NOT NULL DEFAULT 1,
     status inbound_order_status NOT NULL DEFAULT 'ISSUED',
     expected_delivery date,
     created_at timestamptz NOT NULL DEFAULT now(),

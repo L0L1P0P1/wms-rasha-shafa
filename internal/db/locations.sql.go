@@ -22,15 +22,14 @@ INSERT INTO storage_nodes (
     max_volume_cm3,
     is_active
 ) VALUES (
-    $1,
-    ''::ltree, -- Trigger set_storage_node_path computes the real path
-    $2, $3, $4, $5, $6, $7
+    $1, $2, $3, $4, $5, $6, $7, $8
 )
 RETURNING id, parent_id, path::text AS path, code, node_type, is_movable, max_weight_kg, max_volume_cm3, is_active, created_at
 `
 
 type CreateStorageNodeParams struct {
 	ParentID     pgtype.Int8
+	Path         pgtype.Text
 	Code         string
 	NodeType     StorageNodeType
 	IsMovable    bool
@@ -55,6 +54,7 @@ type CreateStorageNodeRow struct {
 func (q *Queries) CreateStorageNode(ctx context.Context, arg CreateStorageNodeParams) (CreateStorageNodeRow, error) {
 	row := q.db.QueryRow(ctx, createStorageNode,
 		arg.ParentID,
+		arg.Path,
 		arg.Code,
 		arg.NodeType,
 		arg.IsMovable,
@@ -281,9 +281,55 @@ func (q *Queries) ListSubtreeNodes(ctx context.Context, id int64) ([]ListSubtree
 	return items, nil
 }
 
+const recordNodeRelocation = `-- name: RecordNodeRelocation :one
+INSERT INTO node_relocations (
+    node_id,
+    from_parent_id,
+    to_parent_id,
+    from_path,
+    to_path,
+    operator_id
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+RETURNING id, node_id, from_parent_id, to_parent_id, from_path, to_path, operator_id, created_at
+`
+
+type RecordNodeRelocationParams struct {
+	NodeID       int64
+	FromParentID pgtype.Int8
+	ToParentID   pgtype.Int8
+	FromPath     string
+	ToPath       string
+	OperatorID   string
+}
+
+func (q *Queries) RecordNodeRelocation(ctx context.Context, arg RecordNodeRelocationParams) (NodeRelocation, error) {
+	row := q.db.QueryRow(ctx, recordNodeRelocation,
+		arg.NodeID,
+		arg.FromParentID,
+		arg.ToParentID,
+		arg.FromPath,
+		arg.ToPath,
+		arg.OperatorID,
+	)
+	var i NodeRelocation
+	err := row.Scan(
+		&i.ID,
+		&i.NodeID,
+		&i.FromParentID,
+		&i.ToParentID,
+		&i.FromPath,
+		&i.ToPath,
+		&i.OperatorID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const reparentStorageNode = `-- name: ReparentStorageNode :one
 UPDATE storage_nodes
-SET parent_id = $2
+SET parent_id = $2, path = $3
 WHERE id = $1
 RETURNING id, parent_id, path::text AS path, code, node_type, is_movable, max_weight_kg, max_volume_cm3, is_active, created_at
 `
@@ -291,6 +337,7 @@ RETURNING id, parent_id, path::text AS path, code, node_type, is_movable, max_we
 type ReparentStorageNodeParams struct {
 	ID       int64
 	ParentID pgtype.Int8
+	Path     pgtype.Text
 }
 
 type ReparentStorageNodeRow struct {
@@ -307,7 +354,7 @@ type ReparentStorageNodeRow struct {
 }
 
 func (q *Queries) ReparentStorageNode(ctx context.Context, arg ReparentStorageNodeParams) (ReparentStorageNodeRow, error) {
-	row := q.db.QueryRow(ctx, reparentStorageNode, arg.ID, arg.ParentID)
+	row := q.db.QueryRow(ctx, reparentStorageNode, arg.ID, arg.ParentID, arg.Path)
 	var i ReparentStorageNodeRow
 	err := row.Scan(
 		&i.ID,
@@ -381,4 +428,18 @@ func (q *Queries) UpdateStorageNodeDetails(ctx context.Context, arg UpdateStorag
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const updateStorageNodePath = `-- name: UpdateStorageNodePath :exec
+UPDATE storage_nodes SET path = $2 WHERE id = $1
+`
+
+type UpdateStorageNodePathParams struct {
+	ID   int64
+	Path pgtype.Text
+}
+
+func (q *Queries) UpdateStorageNodePath(ctx context.Context, arg UpdateStorageNodePathParams) error {
+	_, err := q.db.Exec(ctx, updateStorageNodePath, arg.ID, arg.Path)
+	return err
 }

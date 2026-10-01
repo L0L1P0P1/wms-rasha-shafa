@@ -27,8 +27,9 @@ LIMIT $2 OFFSET $3;
 UPDATE outbound_orders
 SET
     status = $2,
+    version = version + 1,
     updated_at = now()
-WHERE id = $1
+WHERE id = $1 AND version = $3
 RETURNING *;
 
 -- name: CreateOutboundOrderLine :one
@@ -44,7 +45,7 @@ INSERT INTO outbound_order_lines (
 RETURNING *;
 
 -- name: GetOutboundOrderLines :many
-SELECT ol.*, s.id, s.name AS sku_name, p.unit_name
+SELECT ol.*, s.id AS sku_uuid, s.name AS sku_name, p.unit_name
 FROM outbound_order_lines ol
 JOIN stock_keeping_units s ON ol.sku_id = s.id
 JOIN sku_packaging_units p ON ol.pku_id = p.id
@@ -58,4 +59,42 @@ RETURNING *;
 
 -- name: DeleteOutboundOrder :execrows
 DELETE FROM outbound_orders
+WHERE id = $1;
+
+-- name: CreateShipment :one
+INSERT INTO shipments (
+    shipment_number,
+    carrier_name,
+    master_tracking_number,
+    status
+) VALUES (
+    $1, $2, $3, $4
+)
+RETURNING *;
+
+-- name: CreateHandlingUnit :one
+INSERT INTO handling_units (
+    outbound_order_id,
+    sscc,
+    tare_weight_kg,
+    gross_weight_kg
+) VALUES (
+    $1, $2, $3, $4
+)
+RETURNING *;
+
+-- name: PackHandlingUnitContent :one
+INSERT INTO handling_unit_contents (
+    handling_unit_id,
+    allocation_id,
+    packed_quantity
+) VALUES (
+    $1, $2, $3
+)
+RETURNING *;
+
+-- name: AssignHandlingUnitToShipment :exec
+UPDATE handling_units
+SET shipment_id = $2,
+    tracking_number = COALESCE(sqlc.narg('tracking_number'), tracking_number)
 WHERE id = $1;

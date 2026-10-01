@@ -20,7 +20,7 @@ INSERT INTO inbound_orders (
 ) VALUES (
     $1, $2, $3, $4
 )
-RETURNING id, po_number, vendor_name, status, expected_delivery, created_at, updated_at
+RETURNING id, po_number, tenant_id, vendor_name, version, status, expected_delivery, created_at, updated_at
 `
 
 type CreateInboundOrderParams struct {
@@ -41,7 +41,9 @@ func (q *Queries) CreateInboundOrder(ctx context.Context, arg CreateInboundOrder
 	err := row.Scan(
 		&i.ID,
 		&i.PoNumber,
+		&i.TenantID,
 		&i.VendorName,
+		&i.Version,
 		&i.Status,
 		&i.ExpectedDelivery,
 		&i.CreatedAt,
@@ -89,6 +91,93 @@ func (q *Queries) CreateInboundOrderLine(ctx context.Context, arg CreateInboundO
 	return i, err
 }
 
+const createReceipt = `-- name: CreateReceipt :one
+INSERT INTO receipts (
+    inbound_order_id,
+    receipt_number,
+    status,
+    operator_id
+) VALUES (
+    $1, $2, $3, $4
+)
+RETURNING id, inbound_order_id, receipt_number, status, operator_id, received_at
+`
+
+type CreateReceiptParams struct {
+	InboundOrderID int64
+	ReceiptNumber  string
+	Status         ReceiptStatus
+	OperatorID     string
+}
+
+func (q *Queries) CreateReceipt(ctx context.Context, arg CreateReceiptParams) (Receipt, error) {
+	row := q.db.QueryRow(ctx, createReceipt,
+		arg.InboundOrderID,
+		arg.ReceiptNumber,
+		arg.Status,
+		arg.OperatorID,
+	)
+	var i Receipt
+	err := row.Scan(
+		&i.ID,
+		&i.InboundOrderID,
+		&i.ReceiptNumber,
+		&i.Status,
+		&i.OperatorID,
+		&i.ReceivedAt,
+	)
+	return i, err
+}
+
+const createReceiptLine = `-- name: CreateReceiptLine :one
+INSERT INTO receipt_lines (
+    receipt_id,
+    inbound_order_line_id,
+    sku_id,
+    pku_id,
+    lot_id,
+    received_quantity,
+    package_count
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7
+)
+RETURNING id, receipt_id, inbound_order_line_id, sku_id, pku_id, lot_id, received_quantity, package_count
+`
+
+type CreateReceiptLineParams struct {
+	ReceiptID          int64
+	InboundOrderLineID pgtype.Int8
+	SkuID              int64
+	PkuID              int64
+	LotID              pgtype.Int8
+	ReceivedQuantity   pgtype.Numeric
+	PackageCount       pgtype.Numeric
+}
+
+func (q *Queries) CreateReceiptLine(ctx context.Context, arg CreateReceiptLineParams) (ReceiptLine, error) {
+	row := q.db.QueryRow(ctx, createReceiptLine,
+		arg.ReceiptID,
+		arg.InboundOrderLineID,
+		arg.SkuID,
+		arg.PkuID,
+		arg.LotID,
+		arg.ReceivedQuantity,
+		arg.PackageCount,
+	)
+	var i ReceiptLine
+	err := row.Scan(
+		&i.ID,
+		&i.ReceiptID,
+		&i.InboundOrderLineID,
+		&i.SkuID,
+		&i.PkuID,
+		&i.LotID,
+		&i.ReceivedQuantity,
+		&i.PackageCount,
+	)
+	return i, err
+}
+
 const deleteInboundOrder = `-- name: DeleteInboundOrder :execrows
 DELETE FROM inbound_orders
 WHERE id = $1
@@ -103,7 +192,7 @@ func (q *Queries) DeleteInboundOrder(ctx context.Context, id int64) (int64, erro
 }
 
 const getInboundOrderByID = `-- name: GetInboundOrderByID :one
-SELECT id, po_number, vendor_name, status, expected_delivery, created_at, updated_at FROM inbound_orders
+SELECT id, po_number, tenant_id, vendor_name, version, status, expected_delivery, created_at, updated_at FROM inbound_orders
 WHERE id = $1 LIMIT 1
 `
 
@@ -113,7 +202,9 @@ func (q *Queries) GetInboundOrderByID(ctx context.Context, id int64) (InboundOrd
 	err := row.Scan(
 		&i.ID,
 		&i.PoNumber,
+		&i.TenantID,
 		&i.VendorName,
+		&i.Version,
 		&i.Status,
 		&i.ExpectedDelivery,
 		&i.CreatedAt,
@@ -123,7 +214,7 @@ func (q *Queries) GetInboundOrderByID(ctx context.Context, id int64) (InboundOrd
 }
 
 const getInboundOrderByPONumber = `-- name: GetInboundOrderByPONumber :one
-SELECT id, po_number, vendor_name, status, expected_delivery, created_at, updated_at FROM inbound_orders
+SELECT id, po_number, tenant_id, vendor_name, version, status, expected_delivery, created_at, updated_at FROM inbound_orders
 WHERE po_number = $1 LIMIT 1
 `
 
@@ -133,7 +224,9 @@ func (q *Queries) GetInboundOrderByPONumber(ctx context.Context, poNumber string
 	err := row.Scan(
 		&i.ID,
 		&i.PoNumber,
+		&i.TenantID,
 		&i.VendorName,
+		&i.Version,
 		&i.Status,
 		&i.ExpectedDelivery,
 		&i.CreatedAt,
@@ -143,7 +236,7 @@ func (q *Queries) GetInboundOrderByPONumber(ctx context.Context, poNumber string
 }
 
 const getInboundOrderLines = `-- name: GetInboundOrderLines :many
-SELECT il.id, il.inbound_order_id, il.sku_id, il.pku_id, il.expected_quantity, il.received_quantity, s.id, s.name AS sku_name, p.unit_name
+SELECT il.id, il.inbound_order_id, il.sku_id, il.pku_id, il.expected_quantity, il.received_quantity, s.id AS sku_uuid, s.name AS sku_name, p.unit_name
 FROM inbound_order_lines il
 JOIN stock_keeping_units s ON il.sku_id = s.id
 JOIN sku_packaging_units p ON il.pku_id = p.id
@@ -157,7 +250,7 @@ type GetInboundOrderLinesRow struct {
 	PkuID            int64
 	ExpectedQuantity pgtype.Numeric
 	ReceivedQuantity pgtype.Numeric
-	ID_2             int64
+	SkuUuid          int64
 	SkuName          string
 	UnitName         string
 }
@@ -178,7 +271,7 @@ func (q *Queries) GetInboundOrderLines(ctx context.Context, inboundOrderID int64
 			&i.PkuID,
 			&i.ExpectedQuantity,
 			&i.ReceivedQuantity,
-			&i.ID_2,
+			&i.SkuUuid,
 			&i.SkuName,
 			&i.UnitName,
 		); err != nil {
@@ -222,27 +315,57 @@ const updateInboundOrderStatus = `-- name: UpdateInboundOrderStatus :one
 UPDATE inbound_orders
 SET
     status = $2,
+    version = version + 1,
     updated_at = now()
-WHERE id = $1
-RETURNING id, po_number, vendor_name, status, expected_delivery, created_at, updated_at
+WHERE id = $1 AND version = $3
+RETURNING id, po_number, tenant_id, vendor_name, version, status, expected_delivery, created_at, updated_at
 `
 
 type UpdateInboundOrderStatusParams struct {
-	ID     int64
-	Status InboundOrderStatus
+	ID      int64
+	Status  InboundOrderStatus
+	Version int32
 }
 
 func (q *Queries) UpdateInboundOrderStatus(ctx context.Context, arg UpdateInboundOrderStatusParams) (InboundOrder, error) {
-	row := q.db.QueryRow(ctx, updateInboundOrderStatus, arg.ID, arg.Status)
+	row := q.db.QueryRow(ctx, updateInboundOrderStatus, arg.ID, arg.Status, arg.Version)
 	var i InboundOrder
 	err := row.Scan(
 		&i.ID,
 		&i.PoNumber,
+		&i.TenantID,
 		&i.VendorName,
+		&i.Version,
 		&i.Status,
 		&i.ExpectedDelivery,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateReceiptStatus = `-- name: UpdateReceiptStatus :one
+UPDATE receipts
+SET status = $2
+WHERE id = $1
+RETURNING id, inbound_order_id, receipt_number, status, operator_id, received_at
+`
+
+type UpdateReceiptStatusParams struct {
+	ID     int64
+	Status ReceiptStatus
+}
+
+func (q *Queries) UpdateReceiptStatus(ctx context.Context, arg UpdateReceiptStatusParams) (Receipt, error) {
+	row := q.db.QueryRow(ctx, updateReceiptStatus, arg.ID, arg.Status)
+	var i Receipt
+	err := row.Scan(
+		&i.ID,
+		&i.InboundOrderID,
+		&i.ReceiptNumber,
+		&i.Status,
+		&i.OperatorID,
+		&i.ReceivedAt,
 	)
 	return i, err
 }

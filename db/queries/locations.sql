@@ -9,9 +9,7 @@ INSERT INTO storage_nodes (
     max_volume_cm3,
     is_active
 ) VALUES (
-    $1,
-    ''::ltree, -- Trigger set_storage_node_path computes the real path
-    $2, $3, $4, $5, $6, $7
+    $1, $2, $3, $4, $5, $6, $7, $8
 )
 RETURNING id, parent_id, path::text AS path, code, node_type, is_movable, max_weight_kg, max_volume_cm3, is_active, created_at;
 
@@ -53,9 +51,12 @@ ORDER BY code ASC;
 
 -- name: ReparentStorageNode :one
 UPDATE storage_nodes
-SET parent_id = $2
+SET parent_id = $2, path = $3
 WHERE id = $1
 RETURNING id, parent_id, path::text AS path, code, node_type, is_movable, max_weight_kg, max_volume_cm3, is_active, created_at;
+
+-- name: UpdateStorageNodePath :exec
+UPDATE storage_nodes SET path = $2 WHERE id = $1;
 
 -- name: UpdateStorageNodeDetails :one
 UPDATE storage_nodes
@@ -71,3 +72,16 @@ RETURNING id, parent_id, path::text AS path, code, node_type, is_movable, max_we
 -- name: DeleteStorageNode :execrows
 DELETE FROM storage_nodes
 WHERE id = $1;
+
+-- name: RecordNodeRelocation :one
+INSERT INTO node_relocations (
+    node_id,
+    from_parent_id,
+    to_parent_id,
+    from_path,
+    to_path,
+    operator_id
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+RETURNING *;

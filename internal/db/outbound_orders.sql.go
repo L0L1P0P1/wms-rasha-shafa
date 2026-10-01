@@ -11,6 +11,64 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const assignHandlingUnitToShipment = `-- name: AssignHandlingUnitToShipment :exec
+UPDATE handling_units
+SET shipment_id = $2,
+    tracking_number = COALESCE($3, tracking_number)
+WHERE id = $1
+`
+
+type AssignHandlingUnitToShipmentParams struct {
+	ID             int64
+	ShipmentID     pgtype.Int8
+	TrackingNumber pgtype.Text
+}
+
+func (q *Queries) AssignHandlingUnitToShipment(ctx context.Context, arg AssignHandlingUnitToShipmentParams) error {
+	_, err := q.db.Exec(ctx, assignHandlingUnitToShipment, arg.ID, arg.ShipmentID, arg.TrackingNumber)
+	return err
+}
+
+const createHandlingUnit = `-- name: CreateHandlingUnit :one
+INSERT INTO handling_units (
+    outbound_order_id,
+    sscc,
+    tare_weight_kg,
+    gross_weight_kg
+) VALUES (
+    $1, $2, $3, $4
+)
+RETURNING id, outbound_order_id, shipment_id, sscc, tracking_number, tare_weight_kg, gross_weight_kg, created_at
+`
+
+type CreateHandlingUnitParams struct {
+	OutboundOrderID int64
+	Sscc            pgtype.Text
+	TareWeightKg    pgtype.Numeric
+	GrossWeightKg   pgtype.Numeric
+}
+
+func (q *Queries) CreateHandlingUnit(ctx context.Context, arg CreateHandlingUnitParams) (HandlingUnit, error) {
+	row := q.db.QueryRow(ctx, createHandlingUnit,
+		arg.OutboundOrderID,
+		arg.Sscc,
+		arg.TareWeightKg,
+		arg.GrossWeightKg,
+	)
+	var i HandlingUnit
+	err := row.Scan(
+		&i.ID,
+		&i.OutboundOrderID,
+		&i.ShipmentID,
+		&i.Sscc,
+		&i.TrackingNumber,
+		&i.TareWeightKg,
+		&i.GrossWeightKg,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createOutboundOrder = `-- name: CreateOutboundOrder :one
 INSERT INTO outbound_orders (
     order_number,
@@ -20,7 +78,7 @@ INSERT INTO outbound_orders (
 ) VALUES (
     $1, $2, $3, $4
 )
-RETURNING id, order_number, customer_name, status, priority, created_at, updated_at
+RETURNING id, tenant_id, order_number, version, customer_name, status, priority, created_at, updated_at
 `
 
 type CreateOutboundOrderParams struct {
@@ -40,7 +98,9 @@ func (q *Queries) CreateOutboundOrder(ctx context.Context, arg CreateOutboundOrd
 	var i OutboundOrder
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.OrderNumber,
+		&i.Version,
 		&i.CustomerName,
 		&i.Status,
 		&i.Priority,
@@ -89,6 +149,45 @@ func (q *Queries) CreateOutboundOrderLine(ctx context.Context, arg CreateOutboun
 	return i, err
 }
 
+const createShipment = `-- name: CreateShipment :one
+INSERT INTO shipments (
+    shipment_number,
+    carrier_name,
+    master_tracking_number,
+    status
+) VALUES (
+    $1, $2, $3, $4
+)
+RETURNING id, shipment_number, carrier_name, master_tracking_number, status, shipped_at, created_at
+`
+
+type CreateShipmentParams struct {
+	ShipmentNumber       string
+	CarrierName          string
+	MasterTrackingNumber pgtype.Text
+	Status               ShipmentStatus
+}
+
+func (q *Queries) CreateShipment(ctx context.Context, arg CreateShipmentParams) (Shipment, error) {
+	row := q.db.QueryRow(ctx, createShipment,
+		arg.ShipmentNumber,
+		arg.CarrierName,
+		arg.MasterTrackingNumber,
+		arg.Status,
+	)
+	var i Shipment
+	err := row.Scan(
+		&i.ID,
+		&i.ShipmentNumber,
+		&i.CarrierName,
+		&i.MasterTrackingNumber,
+		&i.Status,
+		&i.ShippedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const deleteOutboundOrder = `-- name: DeleteOutboundOrder :execrows
 DELETE FROM outbound_orders
 WHERE id = $1
@@ -103,7 +202,7 @@ func (q *Queries) DeleteOutboundOrder(ctx context.Context, id int64) (int64, err
 }
 
 const getOutboundOrderByID = `-- name: GetOutboundOrderByID :one
-SELECT id, order_number, customer_name, status, priority, created_at, updated_at FROM outbound_orders
+SELECT id, tenant_id, order_number, version, customer_name, status, priority, created_at, updated_at FROM outbound_orders
 WHERE id = $1 LIMIT 1
 `
 
@@ -112,7 +211,9 @@ func (q *Queries) GetOutboundOrderByID(ctx context.Context, id int64) (OutboundO
 	var i OutboundOrder
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.OrderNumber,
+		&i.Version,
 		&i.CustomerName,
 		&i.Status,
 		&i.Priority,
@@ -123,7 +224,7 @@ func (q *Queries) GetOutboundOrderByID(ctx context.Context, id int64) (OutboundO
 }
 
 const getOutboundOrderByNumber = `-- name: GetOutboundOrderByNumber :one
-SELECT id, order_number, customer_name, status, priority, created_at, updated_at FROM outbound_orders
+SELECT id, tenant_id, order_number, version, customer_name, status, priority, created_at, updated_at FROM outbound_orders
 WHERE order_number = $1 LIMIT 1
 `
 
@@ -132,7 +233,9 @@ func (q *Queries) GetOutboundOrderByNumber(ctx context.Context, orderNumber stri
 	var i OutboundOrder
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.OrderNumber,
+		&i.Version,
 		&i.CustomerName,
 		&i.Status,
 		&i.Priority,
@@ -143,7 +246,7 @@ func (q *Queries) GetOutboundOrderByNumber(ctx context.Context, orderNumber stri
 }
 
 const getOutboundOrderLines = `-- name: GetOutboundOrderLines :many
-SELECT ol.id, ol.order_id, ol.sku_id, ol.pku_id, ol.requested_quantity, ol.fulfilled_quantity, s.id, s.name AS sku_name, p.unit_name
+SELECT ol.id, ol.order_id, ol.sku_id, ol.pku_id, ol.requested_quantity, ol.fulfilled_quantity, s.id AS sku_uuid, s.name AS sku_name, p.unit_name
 FROM outbound_order_lines ol
 JOIN stock_keeping_units s ON ol.sku_id = s.id
 JOIN sku_packaging_units p ON ol.pku_id = p.id
@@ -157,7 +260,7 @@ type GetOutboundOrderLinesRow struct {
 	PkuID             int64
 	RequestedQuantity pgtype.Numeric
 	FulfilledQuantity pgtype.Numeric
-	ID_2              int64
+	SkuUuid           int64
 	SkuName           string
 	UnitName          string
 }
@@ -178,7 +281,7 @@ func (q *Queries) GetOutboundOrderLines(ctx context.Context, orderID int64) ([]G
 			&i.PkuID,
 			&i.RequestedQuantity,
 			&i.FulfilledQuantity,
-			&i.ID_2,
+			&i.SkuUuid,
 			&i.SkuName,
 			&i.UnitName,
 		); err != nil {
@@ -219,7 +322,7 @@ func (q *Queries) IncrementOrderLineFulfillment(ctx context.Context, arg Increme
 }
 
 const listOrdersByStatus = `-- name: ListOrdersByStatus :many
-SELECT id, order_number, customer_name, status, priority, created_at, updated_at FROM outbound_orders
+SELECT id, tenant_id, order_number, version, customer_name, status, priority, created_at, updated_at FROM outbound_orders
 WHERE status = $1
 ORDER BY priority DESC, created_at ASC
 LIMIT $2 OFFSET $3
@@ -242,7 +345,9 @@ func (q *Queries) ListOrdersByStatus(ctx context.Context, arg ListOrdersByStatus
 		var i OutboundOrder
 		if err := rows.Scan(
 			&i.ID,
+			&i.TenantID,
 			&i.OrderNumber,
+			&i.Version,
 			&i.CustomerName,
 			&i.Status,
 			&i.Priority,
@@ -259,26 +364,59 @@ func (q *Queries) ListOrdersByStatus(ctx context.Context, arg ListOrdersByStatus
 	return items, nil
 }
 
+const packHandlingUnitContent = `-- name: PackHandlingUnitContent :one
+INSERT INTO handling_unit_contents (
+    handling_unit_id,
+    allocation_id,
+    packed_quantity
+) VALUES (
+    $1, $2, $3
+)
+RETURNING id, handling_unit_id, allocation_id, packed_quantity
+`
+
+type PackHandlingUnitContentParams struct {
+	HandlingUnitID int64
+	AllocationID   int64
+	PackedQuantity pgtype.Numeric
+}
+
+func (q *Queries) PackHandlingUnitContent(ctx context.Context, arg PackHandlingUnitContentParams) (HandlingUnitContent, error) {
+	row := q.db.QueryRow(ctx, packHandlingUnitContent, arg.HandlingUnitID, arg.AllocationID, arg.PackedQuantity)
+	var i HandlingUnitContent
+	err := row.Scan(
+		&i.ID,
+		&i.HandlingUnitID,
+		&i.AllocationID,
+		&i.PackedQuantity,
+	)
+	return i, err
+}
+
 const updateOutboundOrderStatus = `-- name: UpdateOutboundOrderStatus :one
 UPDATE outbound_orders
 SET
     status = $2,
+    version = version + 1,
     updated_at = now()
-WHERE id = $1
-RETURNING id, order_number, customer_name, status, priority, created_at, updated_at
+WHERE id = $1 AND version = $3
+RETURNING id, tenant_id, order_number, version, customer_name, status, priority, created_at, updated_at
 `
 
 type UpdateOutboundOrderStatusParams struct {
-	ID     int64
-	Status OrderStatus
+	ID      int64
+	Status  OrderStatus
+	Version int32
 }
 
 func (q *Queries) UpdateOutboundOrderStatus(ctx context.Context, arg UpdateOutboundOrderStatusParams) (OutboundOrder, error) {
-	row := q.db.QueryRow(ctx, updateOutboundOrderStatus, arg.ID, arg.Status)
+	row := q.db.QueryRow(ctx, updateOutboundOrderStatus, arg.ID, arg.Status, arg.Version)
 	var i OutboundOrder
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.OrderNumber,
+		&i.Version,
 		&i.CustomerName,
 		&i.Status,
 		&i.Priority,

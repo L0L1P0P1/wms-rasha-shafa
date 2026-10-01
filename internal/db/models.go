@@ -197,6 +197,93 @@ func (ns NullOrderStatus) Value() (driver.Value, error) {
 	return string(ns.OrderStatus), nil
 }
 
+type ReceiptStatus string
+
+const (
+	ReceiptStatusRECEIVING ReceiptStatus = "RECEIVING"
+	ReceiptStatusCOMPLETED ReceiptStatus = "COMPLETED"
+	ReceiptStatusCANCELLED ReceiptStatus = "CANCELLED"
+)
+
+func (e *ReceiptStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = ReceiptStatus(s)
+	case string:
+		*e = ReceiptStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for ReceiptStatus: %T", src)
+	}
+	return nil
+}
+
+type NullReceiptStatus struct {
+	ReceiptStatus ReceiptStatus
+	Valid         bool // Valid is true if ReceiptStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullReceiptStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.ReceiptStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.ReceiptStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullReceiptStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.ReceiptStatus), nil
+}
+
+type ShipmentStatus string
+
+const (
+	ShipmentStatusSTAGED    ShipmentStatus = "STAGED"
+	ShipmentStatusSHIPPED   ShipmentStatus = "SHIPPED"
+	ShipmentStatusDELIVERED ShipmentStatus = "DELIVERED"
+	ShipmentStatusCANCELLED ShipmentStatus = "CANCELLED"
+)
+
+func (e *ShipmentStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = ShipmentStatus(s)
+	case string:
+		*e = ShipmentStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for ShipmentStatus: %T", src)
+	}
+	return nil
+}
+
+type NullShipmentStatus struct {
+	ShipmentStatus ShipmentStatus
+	Valid          bool // Valid is true if ShipmentStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullShipmentStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.ShipmentStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.ShipmentStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullShipmentStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.ShipmentStatus), nil
+}
+
 type StorageNodeType string
 
 const (
@@ -381,10 +468,30 @@ func (ns NullUom) Value() (driver.Value, error) {
 	return string(ns.Uom), nil
 }
 
+type HandlingUnit struct {
+	ID              int64
+	OutboundOrderID int64
+	ShipmentID      pgtype.Int8
+	Sscc            pgtype.Text
+	TrackingNumber  pgtype.Text
+	TareWeightKg    pgtype.Numeric
+	GrossWeightKg   pgtype.Numeric
+	CreatedAt       pgtype.Timestamptz
+}
+
+type HandlingUnitContent struct {
+	ID             int64
+	HandlingUnitID int64
+	AllocationID   int64
+	PackedQuantity pgtype.Numeric
+}
+
 type InboundOrder struct {
 	ID               int64
 	PoNumber         string
+	TenantID         pgtype.Int8
 	VendorName       string
+	Version          int32
 	Status           InboundOrderStatus
 	ExpectedDelivery pgtype.Date
 	CreatedAt        pgtype.Timestamptz
@@ -404,7 +511,9 @@ type InventoryAllocation struct {
 	ID                int64
 	OrderLineID       int64
 	BalanceID         int64
+	SkuID             int64
 	AllocatedQuantity pgtype.Numeric
+	PickedQuantity    pgtype.Numeric
 	CreatedAt         pgtype.Timestamptz
 }
 
@@ -416,6 +525,7 @@ type InventoryBalance struct {
 	LotID        pgtype.Int8
 	IsSealed     bool
 	PackageCount pgtype.Numeric
+	Version      int32
 	OnHand       pgtype.Numeric
 	Allocated    pgtype.Numeric
 	UpdatedAt    pgtype.Timestamptz
@@ -448,9 +558,22 @@ type Lot struct {
 	ReceivedAt     pgtype.Timestamptz
 }
 
+type NodeRelocation struct {
+	ID           int64
+	NodeID       int64
+	FromParentID pgtype.Int8
+	ToParentID   pgtype.Int8
+	FromPath     string
+	ToPath       string
+	OperatorID   string
+	CreatedAt    pgtype.Timestamptz
+}
+
 type OutboundOrder struct {
 	ID           int64
+	TenantID     pgtype.Int8
 	OrderNumber  string
+	Version      int32
 	CustomerName pgtype.Text
 	Status       OrderStatus
 	Priority     int32
@@ -465,6 +588,36 @@ type OutboundOrderLine struct {
 	PkuID             int64
 	RequestedQuantity pgtype.Numeric
 	FulfilledQuantity pgtype.Numeric
+}
+
+type Receipt struct {
+	ID             int64
+	InboundOrderID int64
+	ReceiptNumber  string
+	Status         ReceiptStatus
+	OperatorID     string
+	ReceivedAt     pgtype.Timestamptz
+}
+
+type ReceiptLine struct {
+	ID                 int64
+	ReceiptID          int64
+	InboundOrderLineID pgtype.Int8
+	SkuID              int64
+	PkuID              int64
+	LotID              pgtype.Int8
+	ReceivedQuantity   pgtype.Numeric
+	PackageCount       pgtype.Numeric
+}
+
+type Shipment struct {
+	ID                   int64
+	ShipmentNumber       string
+	CarrierName          string
+	MasterTrackingNumber pgtype.Text
+	Status               ShipmentStatus
+	ShippedAt            pgtype.Timestamptz
+	CreatedAt            pgtype.Timestamptz
 }
 
 type SkuPackagingUnit struct {
@@ -486,6 +639,7 @@ type StockKeepingUnit struct {
 	BaseUom             Uom
 	IsDiscrete          bool
 	RequiresLotTracking bool
+	TenantID            pgtype.Int8
 	Attributes          []byte
 	CreatedAt           pgtype.Timestamptz
 }
@@ -493,7 +647,7 @@ type StockKeepingUnit struct {
 type StorageNode struct {
 	ID           int64
 	ParentID     pgtype.Int8
-	Path         string
+	Path         pgtype.Text
 	Code         string
 	NodeType     StorageNodeType
 	IsMovable    bool

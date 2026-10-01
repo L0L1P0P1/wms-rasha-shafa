@@ -21,8 +21,9 @@ WHERE po_number = $1 LIMIT 1;
 UPDATE inbound_orders
 SET
     status = $2,
+    version = version + 1,
     updated_at = now()
-WHERE id = $1
+WHERE id = $1 AND version = $3
 RETURNING *;
 
 -- name: CreateInboundOrderLine :one
@@ -38,7 +39,7 @@ INSERT INTO inbound_order_lines (
 RETURNING *;
 
 -- name: GetInboundOrderLines :many
-SELECT il.*, s.id, s.name AS sku_name, p.unit_name
+SELECT il.*, s.id AS sku_uuid, s.name AS sku_name, p.unit_name
 FROM inbound_order_lines il
 JOIN stock_keeping_units s ON il.sku_id = s.id
 JOIN sku_packaging_units p ON il.pku_id = p.id
@@ -53,3 +54,34 @@ RETURNING *;
 -- name: DeleteInboundOrder :execrows
 DELETE FROM inbound_orders
 WHERE id = $1;
+
+-- name: CreateReceipt :one
+INSERT INTO receipts (
+    inbound_order_id,
+    receipt_number,
+    status,
+    operator_id
+) VALUES (
+    $1, $2, $3, $4
+)
+RETURNING *;
+
+-- name: UpdateReceiptStatus :one
+UPDATE receipts
+SET status = $2
+WHERE id = $1
+RETURNING *;
+
+-- name: CreateReceiptLine :one
+INSERT INTO receipt_lines (
+    receipt_id,
+    inbound_order_line_id,
+    sku_id,
+    pku_id,
+    lot_id,
+    received_quantity,
+    package_count
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7
+)
+RETURNING *;
