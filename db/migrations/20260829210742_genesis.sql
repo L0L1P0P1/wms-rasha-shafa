@@ -26,6 +26,7 @@ CREATE TABLE stock_keeping_units (
     base_uom uom NOT NULL DEFAULT 'EACH',
     is_discrete boolean NOT NULL DEFAULT true,
     requires_lot_tracking boolean NOT NULL DEFAULT false,
+    tenant_id bigint,
     attributes jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -205,6 +206,7 @@ CREATE TYPE order_status AS ENUM (
 
 CREATE TABLE outbound_orders (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id bigint,
     order_number text COLLATE "C" NOT NULL UNIQUE,
     customer_name text,
     status order_status NOT NULL DEFAULT 'PENDING',
@@ -361,6 +363,7 @@ CREATE TYPE inbound_order_status AS ENUM (
 CREATE TABLE inbound_orders (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     po_number text COLLATE "C" NOT NULL UNIQUE,
+    tenant_id bigint,
     vendor_name text NOT NULL,
     status inbound_order_status NOT NULL DEFAULT 'ISSUED',
     expected_delivery date,
@@ -460,7 +463,107 @@ CREATE TABLE node_relocations (
 
 CREATE INDEX idx_relocations_node ON node_relocations (node_id, created_at DESC);
 
+CREATE TYPE receipt_status AS ENUM (
+    'RECEIVING',  -- Worker is currently scanning items on the dock
+    'COMPLETED',  -- Truck is gone, inventory is confirmed
+    'CANCELLED'
+);
+
+CREATE TABLE receipts (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    inbound_order_id bigint NOT NULL 
+        REFERENCES inbound_orders(id) 
+        ON DELETE RESTRICT,
+    receipt_number text COLLATE "C" NOT NULL UNIQUE,
+    status receipt_status NOT NULL DEFAULT 'RECEIVING',
+    operator_id text COLLATE "C" NOT NULL,
+    received_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE receipt_lines (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    receipt_id bigint NOT NULL 
+        REFERENCES receipts(id) 
+        ON DELETE CASCADE,
+    inbound_order_line_id bigint 
+        REFERENCES inbound_order_lines(id) 
+        ON DELETE RESTRICT,
+    
+    -- The actual physical items counted
+    sku_id bigint NOT NULL REFERENCES stock_keeping_units(id) ON DELETE RESTRICT,
+    pku_id bigint NOT NULL,
+    lot_id bigint,
+    received_quantity numeric(12, 4) NOT NULL CHECK (received_quantity > 0),
+    package_count numeric(12, 4) NOT NULL CHECK (package_count >= 0),
+    
+    -- Maintain strict composites
+    CONSTRAINT fk_receipt_line_pku FOREIGN KEY (pku_id, sku_id) 
+        REFERENCES sku_packaging_units(id, sku_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_receipt_line_lot FOREIGN KEY (lot_id, sku_id) 
+        REFERENCES lots(id, sku_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_receipt_lines_receipt ON receipt_lines(receipt_id);
+
+CREATE TYPE shipment_status AS ENUM (
+    'STAGED',    -- Sitting on the outbound dock
+    'SHIPPED',   -- Carrier picked it up
+    'DELIVERED', -- Optional: Updated via carrier API webhooks
+    'CANCELLED'
+);
+
+CREATE TABLE shipments (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    shipment_number text COLLATE "C" NOT NULL UNIQUE,
+    carrier_name text NOT NULL, -- e.g., 'FedEx', 'UPS', 'Internal Fleet'
+    master_tracking_number text COLLATE "C",
+    status shipment_status NOT NULL DEFAULT 'STAGED',
+    shipped_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Handling Units represent physical boxes, pallets, or totes leaving the building
+CREATE TABLE handling_units (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    outbound_order_id bigint NOT NULL 
+        REFERENCES outbound_orders(id) 
+        ON DELETE RESTRICT,
+    shipment_id bigint 
+        REFERENCES shipments(id) 
+        ON DELETE SET NULL, -- A box is packed before it is assigned to a truck
+        
+    sscc text COLLATE "C" UNIQUE, -- Standard Serial Shipping Container Code barcode
+    tracking_number text COLLATE "C", -- Box-level tracking label
+    
+    tare_weight_kg numeric(10, 3) DEFAULT 0 CHECK (tare_weight_kg >= 0),
+    gross_weight_kg numeric(10, 3) DEFAULT 0 CHECK (gross_weight_kg >= 0),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Maps the internal warehouse allocation to the physical outbound box
+CREATE TABLE handling_unit_contents (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    handling_unit_id bigint NOT NULL 
+        REFERENCES handling_units(id) 
+        ON DELETE CASCADE,
+    allocation_id bigint NOT NULL 
+        REFERENCES inventory_allocations(id) 
+        ON DELETE RESTRICT,
+    packed_quantity numeric(12, 4) NOT NULL CHECK (packed_quantity > 0)
+);
+
+CREATE INDEX idx_handling_units_order ON handling_units(outbound_order_id);
+CREATE INDEX idx_handling_units_shipment ON handling_units(shipment_id);
+
 -- +goose Down
+DROP TABLE IF EXISTS handling_unit_contents;
+DROP TABLE IF EXISTS handling_units;
+DROP TABLE IF EXISTS shipments;
+DROP TYPE IF EXISTS  shipment_status;
+DROP TABLE IF EXISTS receipt_lines;
+DROP TABLE IF EXISTS receipts;
+DROP TYPE IF EXISTS receipt_status;
+
 DROP TABLE IF EXISTS node_relocations;
 DROP TABLE IF EXISTS warehouse_tasks;
 DROP TYPE IF EXISTS task_status;
