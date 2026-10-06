@@ -1,1 +1,1 @@
-package outboundorders
+package outbound_orders
