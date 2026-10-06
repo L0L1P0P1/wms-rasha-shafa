@@ -12,24 +12,32 @@ import (
 )
 
 const createStorageNode = `-- name: CreateStorageNode :one
-INSERT INTO storage_nodes (
-    parent_id,
-    path,
-    code,
-    node_type,
-    is_movable,
-    max_weight_kg,
-    max_volume_cm3,
-    is_active
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8
+WITH new_node AS (
+  INSERT INTO storage_nodes (
+      parent_id,
+      code,
+      node_type,
+      is_movable,
+      max_weight_kg,
+      max_volume_cm3,
+      is_active
+  ) VALUES (
+      $1, $2, $3, $4, $5, $6, $7
+  )
+  RETURNING id, parent_id, path::text AS path, code, node_type, is_movable, max_weight_kg, max_volume_cm3, is_active, created_at
 )
-RETURNING id, parent_id, path::text AS path, code, node_type, is_movable, max_weight_kg, max_volume_cm3, is_active, created_at
+UPDATE storage_nodes n
+SET path = CASE
+  WHEN i.parent_id IS NULL THEN i.id::text::ltree
+  ELSE (SELECT path FROM storage_nodes WHERE id = i.parent_id) || i.id::text::ltree
+END
+FROM new_node i
+WHERE n.id = i.id
+RETURNING n.id, n.parent_id, n.path, n.code, n.node_type, n.is_movable, n.max_weight_kg, n.max_volume_cm3, n.is_active, n.created_at
 `
 
 type CreateStorageNodeParams struct {
 	ParentID     pgtype.Int8
-	Path         pgtype.Text
 	Code         string
 	NodeType     StorageNodeType
 	IsMovable    bool
@@ -38,23 +46,9 @@ type CreateStorageNodeParams struct {
 	IsActive     bool
 }
 
-type CreateStorageNodeRow struct {
-	ID           int64
-	ParentID     pgtype.Int8
-	Path         string
-	Code         string
-	NodeType     StorageNodeType
-	IsMovable    bool
-	MaxWeightKg  pgtype.Numeric
-	MaxVolumeCm3 pgtype.Numeric
-	IsActive     bool
-	CreatedAt    pgtype.Timestamptz
-}
-
-func (q *Queries) CreateStorageNode(ctx context.Context, arg CreateStorageNodeParams) (CreateStorageNodeRow, error) {
+func (q *Queries) CreateStorageNode(ctx context.Context, arg CreateStorageNodeParams) (StorageNode, error) {
 	row := q.db.QueryRow(ctx, createStorageNode,
 		arg.ParentID,
-		arg.Path,
 		arg.Code,
 		arg.NodeType,
 		arg.IsMovable,
@@ -62,7 +56,7 @@ func (q *Queries) CreateStorageNode(ctx context.Context, arg CreateStorageNodePa
 		arg.MaxVolumeCm3,
 		arg.IsActive,
 	)
-	var i CreateStorageNodeRow
+	var i StorageNode
 	err := row.Scan(
 		&i.ID,
 		&i.ParentID,
@@ -327,48 +321,30 @@ func (q *Queries) RecordNodeRelocation(ctx context.Context, arg RecordNodeReloca
 	return i, err
 }
 
-const reparentStorageNode = `-- name: ReparentStorageNode :one
+const reparentStorageNode = `-- name: ReparentStorageNode :exec
 UPDATE storage_nodes
-SET parent_id = $2, path = $3
-WHERE id = $1
-RETURNING id, parent_id, path::text AS path, code, node_type, is_movable, max_weight_kg, max_volume_cm3, is_active, created_at
+SET
+  parent_id = CASE 
+    WHEN storage_nodes.id = t.t_id THEN p.p_id 
+    ELSE storage_nodes.parent_id 
+  END,
+  path = p.p_path || subpath(storage_nodes.path, nlevel(t.t_path) - 1)
+FROM 
+  (SELECT sn1.id AS t_id, sn1.path AS t_path FROM storage_nodes sn1 WHERE sn1.id = $1) AS t
+CROSS JOIN 
+  (SELECT sn2.id AS p_id, sn2.path AS p_path FROM storage_nodes sn2 WHERE sn2.id = $2) AS p
+WHERE storage_nodes.path <@ t.t_path
+  AND NOT (p.p_path <@ t.t_path)
 `
 
 type ReparentStorageNodeParams struct {
-	ID       int64
-	ParentID pgtype.Int8
-	Path     pgtype.Text
+	ID   int64
+	ID_2 int64
 }
 
-type ReparentStorageNodeRow struct {
-	ID           int64
-	ParentID     pgtype.Int8
-	Path         string
-	Code         string
-	NodeType     StorageNodeType
-	IsMovable    bool
-	MaxWeightKg  pgtype.Numeric
-	MaxVolumeCm3 pgtype.Numeric
-	IsActive     bool
-	CreatedAt    pgtype.Timestamptz
-}
-
-func (q *Queries) ReparentStorageNode(ctx context.Context, arg ReparentStorageNodeParams) (ReparentStorageNodeRow, error) {
-	row := q.db.QueryRow(ctx, reparentStorageNode, arg.ID, arg.ParentID, arg.Path)
-	var i ReparentStorageNodeRow
-	err := row.Scan(
-		&i.ID,
-		&i.ParentID,
-		&i.Path,
-		&i.Code,
-		&i.NodeType,
-		&i.IsMovable,
-		&i.MaxWeightKg,
-		&i.MaxVolumeCm3,
-		&i.IsActive,
-		&i.CreatedAt,
-	)
-	return i, err
+func (q *Queries) ReparentStorageNode(ctx context.Context, arg ReparentStorageNodeParams) error {
+	_, err := q.db.Exec(ctx, reparentStorageNode, arg.ID, arg.ID_2)
+	return err
 }
 
 const updateStorageNodeDetails = `-- name: UpdateStorageNodeDetails :one
