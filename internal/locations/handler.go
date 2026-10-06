@@ -140,13 +140,13 @@ func (h *LocationHandler) ReparentStorageNode(w http.ResponseWriter, r *http.Req
 	}
 	params.ID = id
 
-	node, err := h.queries.ReparentStorageNode(r.Context(), params)
+	err = h.queries.ReparentStorageNode(r.Context(), params)
 	if err != nil {
 		shared.ErrorJSON(w, err, http.StatusInternalServerError)
 		return
 	}
 
-	shared.WriteJSON(w, http.StatusOK, node)
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *LocationHandler) DeleteStorageNode(w http.ResponseWriter, r *http.Request) {
