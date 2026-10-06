@@ -1,0 +1,3613 @@
+openapi: 3.0.3
+
+info:
+  title: Rasha Shafa WMS API
+  version: 1.0.0
+  description: |
+    Warehouse Management System (WMS) core engine.
+
+    This document describes the **full HTTP surface** of the API, including the
+    endpoints that are routed today and the endpoints that still need handlers or
+    route registration. Use the `x-handler` / `x-handler-gap` extensions to
+    prioritise implementation work.
+
+    ## Conventions
+
+    ### JSON field naming
+    Handlers bind request bodies directly into the sqlc-generated `*Params` structs
+    via `shared.ReadJSON`, and those structs carry **no `json` tags**. Until a DTO
+    layer is introduced, request and response keys are therefore **Go field names
+    in PascalCase** (`PoNumber`, `ExpectedQuantity`, `IsSealed`).
+
+    ### Quantity encoding
+    `NUMERIC` columns are bound as `pgtype.Numeric`, which marshals as a bare JSON
+    number (`12.500`) and accepts a number, a quoted string, or `null` on input.
+
+    ### Luhn-encoded SKU identifiers
+    SKU ids are exposed on the wire with a trailing Luhn check digit:
+
+        external_id = (internal_id * 10) + luhn_check_digit(internal_id)
+
+    `stock_keeping_units.id` starts at `10000`. Handlers strip the check digit
+    (`id / 10`) before querying and re-append it before responding. **Any id you
+    receive for a SKU, packaging unit reference, or lot reference must be the
+    encoded form**, otherwise the handler rejects it with
+    `invalid sku id: must be numeric and satisfy luhn checksum`.
+
+    ### Dual-unit balance rule
+    `on_hand`, `allocated`, `allocated_quantity`, `picked_quantity`,
+    `fulfilled_quantity` and `received_quantity` are **always expressed in the
+    SKU's atomic `base_uom`**, never in packaging units. `package_count` counts
+    physical containers and is only meaningful when `is_sealed` is `true`
+    (enforced by `chk_unsealed_no_packages`).
+
+    ### Optimistic concurrency
+    `inbound_orders`, `outbound_orders` and `inventory_balances` carry a `version`
+    column. Every status/quantity mutation is conditional on `WHERE version = $n`
+    and bumps the version. A mismatch yields `no rows` from sqlc, which the
+    handler surfaces as **500** today — treat a failure here as **409 Conflict**.
+
+    ### Error envelope
+    `shared.ErrorJSON` emits exactly one key:
+
+        {"message": "<err.Error()>"}
+
+    | Status | Meaning in the current handlers |
+    |--------|----------------------------------|
+    | 400 | Malformed JSON, non-numeric path param, failed Luhn check |
+    | 404 | `GetSKU`, `GetInboundOrderByID`, `GetInboundOrderByPONumber`, `GetOutboundOrderByID`, `GetOutboundOrderByNumber`, `GetStorageNode`, `GetStorageNodeByCode` |
+    | 500 | Every database error, including optimistic-concurrency misses |
+
+    ### Pagination
+    Handlers accept `limit` (default `100`) and `offset` (default `0`) as query
+    parameters and return a **bare JSON array** — there is no envelope and no
+    total count. Invalid values are logged and silently replaced with the defaults.
+
+    ### Route resolution
+    A few collections mix literal and wildcard segments at the same position
+    (e.g. `/api/v1/inbound-orders/{id}/status` alongside
+    `/api/v1/inbound-orders/by-po-number/{po_number}`). Go 1.22+ `ServeMux`
+    resolves this deterministically — the literal segment always wins over the
+    wildcard — so `by-po-number` is never captured as an `{id}`. Linters that
+    assume a JSON-Schema-style router will flag these as ambiguous; they are not.
+
+    ### Authentication
+    Not implemented. `middleware.Logging` (request id + `slog`) is the only
+    middleware and is not yet wired. There is no auth, no CORS, and no panic
+    recovery.
+  contact:
+    name: WMS maintainers
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:8888
+    description: Local development server (matches `cmd/main.go`)
+
+tags:
+  - name: Health
+    description: Liveness probe.
+  - name: SKUs
+    description: |
+      Stock keeping units. Identifiers are Luhn-encoded on the wire and all
+      quantities across the API are expressed in the SKU's `base_uom`.
+  - name: Packaging Units
+    description: |
+      Consumable/disposable containers that measure content (`EACH`, `CASE`,
+      `PALLET`), forming a self-referencing hierarchy under each SKU.
+  - name: Lots
+    description: |
+      Batches with manufacture and expiry dates. Only `AVAILABLE` lots are
+      allocatable, which is what makes this the lever for recall and quarantine.
+  - name: Storage Nodes
+    description: |
+      The `ltree`-backed location hierarchy. `path` is server-materialised and
+      rewritten wholesale when a subtree is reparented.
+  - name: Inventory Balances
+    description: |
+      Stock positions keyed on `(node, packaging unit, lot, sealed)` with an
+      optimistic-concurrency `version`, plus the low-level ledger primitives used
+      to project additions and deductions.
+  - name: Inventory Allocations
+    description: |
+      Reservations of a balance against an outbound order line, tracking both
+      allocated and picked quantities.
+  - name: Inventory Movements
+    description: |
+      The immutable, append-only double-entry ledger. Corrections are compensating
+      rows, never edits or deletes.
+  - name: Inbound Orders
+    description: |
+      Expected receipts against a purchase order, and their lines.
+  - name: Receipts
+    description: |
+      The physical goods-receipt events that actually increase stock, as distinct
+      from the expected inbound order.
+  - name: Outbound Orders
+    description: |
+      Customer orders and their lines, driven through
+      `PENDING -> ALLOCATED -> PICKING -> PACKED -> SHIPPED`.
+  - name: Handling Units & Shipments
+    description: |
+      Physical reusable containers and outbound shipments. Note the deliberate
+      distinction from packaging units, which are consumable.
+  - name: Warehouse Tasks
+    description: |
+      The operator work queue. No HTTP surface exists for this domain yet.
+
+security: []
+
+paths:
+  /api/ping:
+    get:
+      tags: [Health]
+      operationId: ping
+      summary: Liveness probe
+      description: |
+        Returns `{"pong":""}`. The field is populated by `ping` in `cmd/main.go`,
+        which currently declares `pong` but never assigns it — the value is always
+        empty. Assign `pong = "pong"` to make the probe meaningful.
+      x-handler: ping (cmd/main.go:23)
+      x-handler-gap: Response value is always the empty string.
+      responses:
+        "200":
+          description: Server is reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pong:
+                    type: string
+                    example: pong
+        "500":
+          description: |
+            Not reachable. The server process is down, or the listener is bound but
+            the `main` goroutine has panicked.
+
+  # ---------------------------------------------------------------- SKUs ----
+  /api/v1/skus:
+    post:
+      tags: [SKUs]
+      operationId: createSku
+      summary: Create a SKU
+      description: |
+        Inserts a stock keeping unit. The generated id is returned Luhn-encoded
+        (`id * 10 + check_digit`); ids begin at `10000`.
+      x-handler: SkuHandler.CreateSKU
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SKUCreate"
+      responses:
+        "201":
+          description: SKU created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SKU"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      tags: [SKUs]
+      operationId: listSkus
+      summary: List SKUs
+      x-handler: SkuHandler.ListSKUs
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: SKUs ordered by id. Ids are Luhn-encoded.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SKU"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      tags: [SKUs]
+      operationId: searchSkusByName
+      summary: Fuzzy-search SKUs by name
+      description: |
+        Trigram search (`pg_trgm`) ordered by similarity. **No handler exists** —
+        `SearchSKUsByName` is generated in `internal/db/skus.sql.go` but nothing
+        calls it. Add `SearchSKUs` to `SkuHandler`.
+      x-handler: null
+      x-handler-gap: Handler and route missing.
+      parameters:
+        - name: name
+          in: query
+          required: true
+          description: Trigram search term.
+          schema:
+            type: string
+          example: bolt
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            default: 100
+            maximum: 500
+      responses:
+        "200":
+          description: Matching SKUs, most similar first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SKU"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/skus/{id}:
+    parameters:
+      - $ref: "#/components/parameters/LuhnIdPath"
+    get:
+      tags: [SKUs]
+      operationId: getSku
+      summary: Get a SKU by id
+      x-handler: SkuHandler.GetSKU
+      x-handler-gap: |
+        The request requires the Luhn-encoded id but the response returns the
+        **raw** database id, because `GetSKU` omits the
+        `sku.ID*10 + CalculateLuhn(sku.ID)` step that `CreateSKU`, `ListSKUs` and
+        `UpdateSKU` all perform. Re-apply the encoding for a consistent contract.
+      responses:
+        "200":
+          description: SKU found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SKU"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [SKUs]
+      operationId: updateSku
+      summary: Update SKU attributes
+      description: Partial update. Omitted (`null`) fields are left untouched.
+      x-handler: SkuHandler.UpdateSKU
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SKUUpdate"
+      responses:
+        "200":
+          description: SKU updated. `id` is Luhn-encoded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SKU"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      tags: [SKUs]
+      operationId: deleteSku
+      summary: Delete a SKU
+      description: |
+        Hard delete. Restricted by `ON DELETE RESTRICT` from lots, balances,
+        movements, order lines and tasks — a SKU with history cannot be deleted.
+      x-handler: SkuHandler.DeleteSKU
+      responses:
+        "204":
+          description: SKU deleted.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ------------------------------------------------------- Packaging Units ---
+  /api/v1/skus/{sku_id}/packaging-units:
+    parameters:
+      - $ref: "#/components/parameters/SkuIdPath"
+    post:
+      tags: [Packaging Units]
+      operationId: createPackagingUnit
+      summary: Create a packaging unit for a SKU
+      description: |
+        `conversion_factor` expresses how many `base_uom` units one container
+        holds, and must be exactly `1.0000` when `isBaseUnit` is true
+        (`chk_base_unit_factor`). A SKU may have at most one base unit (partial
+        unique index). `barcode` is unique across all packaging units.
+      x-handler: SkuHandler.CreatePackagingUnit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PackagingUnitCreate"
+      responses:
+        "201":
+          description: Packaging unit created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackagingUnit"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      tags: [Packaging Units]
+      operationId: listPackagingUnitsBySku
+      summary: List packaging units of a SKU
+      description: Ordered by `conversionFactor` ascending, smallest container first.
+      x-handler: SkuHandler.ListPackagingUnitsBySKU
+      responses:
+        "200":
+          description: Packaging units. `SkuID` is Luhn-encoded.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PackagingUnit"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/packaging-units/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+    get:
+      tags: [Packaging Units]
+      operationId: getPackagingUnitById
+      summary: Get a packaging unit by id
+      x-handler: null
+      x-handler-gap: Handler and route missing (`GetPackagingUnitByID` is generated but uncalled).
+      responses:
+        "200":
+          description: Packaging unit found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackagingUnit"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Packaging Units]
+      operationId: updatePackagingUnit
+      summary: Update a packaging unit
+      description: Partial update. Omitted (`null`) fields are left untouched.
+      x-handler: null
+      x-handler-gap: Handler and route missing (`UpdatePackagingUnit` is generated but uncalled).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PackagingUnitUpdate"
+      responses:
+        "200":
+          description: Packaging unit updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackagingUnit"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      tags: [Packaging Units]
+      operationId: deletePackagingUnit
+      summary: Delete a packaging unit
+      description: |
+        Restricted by `ON DELETE RESTRICT` from balances, movements, order lines
+        and tasks.
+      x-handler: null
+      x-handler-gap: Handler and route missing (`DeletePackagingUnit` is generated but uncalled).
+      responses:
+        "204":
+          description: Packaging unit deleted.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/packaging-units/by-barcode/{barcode}:
+    get:
+      tags: [Packaging Units]
+      operationId: getPackagingUnitByBarcode
+      summary: Scan-resolve a packaging unit by barcode
+      x-handler: null
+      x-handler-gap: Handler and route missing (`GetPackagingUnitByBarcode` is generated but uncalled).
+      parameters:
+        - name: barcode
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Packaging unit found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackagingUnit"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ----------------------------------------------------------------- Lots ---
+  /api/v1/skus/{sku_id}/lots:
+    parameters:
+      - $ref: "#/components/parameters/SkuIdPath"
+    post:
+      tags: [Lots]
+      operationId: createLot
+      summary: Create a lot for a SKU
+      description: '`(skuId, lotNumber)` is unique. Only meaningful for SKUs with `requiresLotTracking: true`.'
+      x-handler: SkuHandler.CreateLot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LotCreate"
+      responses:
+        "201":
+          description: Lot created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Lot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      tags: [Lots]
+      operationId: listLotsBySku
+      summary: List lots of a SKU
+      description: FEFO order — earliest `expiresAt` first, undated lots last.
+      x-handler: SkuHandler.ListLotsBySKU
+      responses:
+        "200":
+          description: Lots. `SkuID` is Luhn-encoded.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Lot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/skus/{sku_id}/lots/{lot_number}:
+    parameters:
+      - $ref: "#/components/parameters/SkuIdPath"
+      - name: lot_number
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Lots]
+      operationId: getLotByNumber
+      summary: Get a lot of a SKU by lot number
+      x-handler: null
+      x-handler-gap: Handler and route missing (`GetLotBySKUAndNumber` is generated but uncalled).
+      responses:
+        "200":
+          description: Lot found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Lot"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/lots/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+    get:
+      tags: [Lots]
+      operationId: getLotById
+      summary: Get a lot by id
+      x-handler: null
+      x-handler-gap: Handler and route missing (`GetLotByID` is generated but uncalled).
+      responses:
+        "200":
+          description: Lot found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Lot"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/lots/{id}/status:
+    patch:
+      tags: [Lots]
+      operationId: updateLotStatus
+      summary: Quarantine, expire or recall a lot
+      description: |
+        `QUARANTINED`, `EXPIRED` and `RECALLED` lots are excluded from
+        `FindReservableBalances` (`l.status IS NULL OR l.status = 'AVAILABLE'`),
+        so this is the lever for stopping new allocations against a lot. It does
+        **not** delete existing balances.
+      x-handler: null
+      x-handler-gap: Handler and route missing (`UpdateLotStatus` is generated but uncalled).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [Status]
+              properties:
+                Status:
+                  $ref: "#/components/schemas/LotStatus"
+      responses:
+        "200":
+          description: Lot status updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Lot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # --------------------------------------------------------- Storage Nodes ---
+  /api/v1/storage-nodes:
+    post:
+      tags: [Storage Nodes]
+      operationId: createStorageNode
+      summary: Create a storage node
+      description: |
+        Nodes form an `ltree` hierarchy. `CreateStorageNode` is a CTE that inserts
+        the row and then derives `path` from the parent's path, so the returned
+        node always carries a complete, freshly-materialised `path`. Leave
+        `ParentId` null to create a `WAREHOUSE`-level root.
+      x-handler: LocationHandler.CreateStorageNode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StorageNodeCreate"
+      responses:
+        "201":
+          description: Storage node created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageNode"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      tags: [Storage Nodes]
+      operationId: listDirectChildNodes
+      summary: List direct children of a parent node
+      description: |
+        Defaults to the top-level nodes (`parent_id IS NULL`) when `parent_id` is
+        omitted. Note that `ListDirectChildNodes` uses `parent_id = $1`, which does
+        **not** match null rows unless the parameter is explicitly NULL — the
+        handler passes an invalid `pgtype.Int8` for the root case, so verify this
+        behaves as intended.
+      x-handler: LocationHandler.ListDirectChildNodes
+      parameters:
+        - name: parent_id
+          in: query
+          required: false
+          description: Parent node id. Omit for top-level nodes.
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Direct children, ordered by `code` ascending.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StorageNode"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/storage-nodes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    get:
+      tags: [Storage Nodes]
+      operationId: getStorageNode
+      summary: Get a storage node by id
+      x-handler: LocationHandler.GetStorageNode
+      responses:
+        "200":
+          description: Storage node found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageNode"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Storage Nodes]
+      operationId: updateStorageNodeDetails
+      summary: Update a storage node's own attributes
+      description: |
+        Partial update of `code`, `isMovable`, `maxWeightKg`, `maxVolumeCm3` and
+        `isActive`. `parentId`, `nodeType` and `path` are **not** editable here —
+        use the reparent endpoint to move a node.
+      x-handler: LocationHandler.UpdateStorageNodeDetails
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StorageNodeUpdate"
+      responses:
+        "200":
+          description: Storage node updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageNode"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      tags: [Storage Nodes]
+      operationId: deleteStorageNode
+      summary: Delete a storage node
+      description: |
+        `ON DELETE RESTRICT` on both `parent_id` and every referencing balance,
+        movement and task. A node with children or with stock cannot be deleted.
+      x-handler: LocationHandler.DeleteStorageNode
+      responses:
+        "204":
+          description: Storage node deleted.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/storage-nodes/by-code/{code}:
+    get:
+      tags: [Storage Nodes]
+      operationId: getStorageNodeByCode
+      summary: Get a storage node by its unique code
+      x-handler: LocationHandler.GetStorageNodeByCode
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Storage node found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageNode"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/storage-nodes/{id}/children:
+    get:
+      tags: [Storage Nodes]
+      operationId: listStorageNodeChildren
+      summary: List direct children of a node
+      description: Alias of `GET /api/v1/storage-nodes` scoped to `{id}`.
+      x-handler: LocationHandler.ListDirectChildNodes
+      x-handler-gap: Route missing. The handler accepts `root` as a literal path value for the top level.
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Direct children, ordered by `code` ascending.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StorageNode"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/storage-nodes/root/children:
+    get:
+      tags: [Storage Nodes]
+      operationId: listRootStorageNodes
+      summary: List top-level storage nodes
+      x-handler: LocationHandler.ListDirectChildNodes
+      x-handler-gap: Route missing.
+      responses:
+        "200":
+          description: Nodes whose `parent_id` is NULL.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StorageNode"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/storage-nodes/{id}/subtree:
+    get:
+      tags: [Storage Nodes]
+      operationId: listStorageNodeSubtree
+      summary: List a node and all of its descendants
+      description: Uses the `ltree` `<@` ancestor operator against the node's own `path`.
+      x-handler: LocationHandler.ListSubtreeNodes
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Subtree, ordered by `path`.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StorageNode"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/storage-nodes/{id}/parent:
+    put:
+      tags: [Storage Nodes]
+      operationId: reparentStorageNode
+      summary: Move a node (and its whole subtree) under a new parent
+      description: |
+        `ReparentStorageNode` rewrites `path` for the node **and every descendant**
+        in one statement using `subpath(...)`. The `AND NOT (p.p_path <@ t.t_path)`
+        guard rejects cycles. Because the handler currently returns bare `200` with
+        no body, consider adding `RecordNodeRelocation` in the same transaction so
+        the move is auditable.
+      x-handler: LocationHandler.ReparentStorageNode
+      x-handler-gap: |
+        `ReparentStorageNodeParams` is `{ID, ID_2}` where `ID_2` is the **new
+        parent**. The handler only sets `params.ID`, so `ID_2` stays `0` and the
+        statement matches no parent. Read `NewParentId` from the body into
+        `params.ID_2`.
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [NewParentId]
+              properties:
+                NewParentId:
+                  type: integer
+                  format: int64
+                  description: New parent node id. Must not be the node itself or one of its descendants.
+      responses:
+        "200":
+          description: Subtree reparented. No response body today.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/storage-nodes/{id}/relocations:
+    post:
+      tags: [Storage Nodes]
+      operationId: recordNodeRelocation
+      summary: Record a node relocation in the audit trail
+      description: |
+        Append-only audit row capturing from/to parent and from/to `ltree` path.
+        Call this in the same transaction as the reparent to keep `node_relocations`
+        consistent with `storage_nodes`.
+
+        Note that the generated `UpdateStorageNodePath` query (a raw
+        `UPDATE storage_nodes SET path = $2`) is deliberately **not** exposed by
+        this document. Writing a node's `path` in isolation would desynchronise it
+        from every descendant, so it must only ever be reached through the
+        reparent statement above.
+      x-handler: null
+      x-handler-gap: Handler and route missing (`RecordNodeRelocation` is generated but uncalled).
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeRelocationCreate"
+      responses:
+        "201":
+          description: Relocation recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeRelocation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ---------------------------------------------------- Inventory Balances ---
+  /api/v1/inventory/balances/node/{node_id}:
+    get:
+      tags: [Inventory Balances]
+      operationId: listBalancesByNode
+      summary: List every stock position at a node
+      description: |
+        Joined with the SKU and packaging unit, so each row carries
+        `skuUuid`, `skuName` and `unitName` alongside the balance columns.
+      x-handler: InventoryHandler.ListBalancesByNode
+      parameters:
+        - $ref: "#/components/parameters/NodeIdPath"
+      responses:
+        "200":
+          description: Stock positions at the node.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BalanceByNode"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inventory/balances/reservable:
+    get:
+      tags: [Inventory Balances]
+      operationId: findReservableBalances
+      summary: Find balances with enough unreserved stock to allocate
+      description: |
+        Returns balances where `on_hand - allocated >= on_hand_min`, restricted to
+        `AVAILABLE` lots, ordered FEFO then largest `on_hand` first. This is the
+        allocation candidate feed — feed `balanceId` from the response into
+        `CreateAllocation`.
+
+        `on_hand_min` must be sent as a number or a quoted string, e.g.
+        `?on_hand=1` or `?on_hand="1.000"`.
+      x-handler: InventoryHandler.FindReservableBalances
+      x-handler-gap: |
+        The handler passes an **empty** `db.FindReservableBalancesParams{}`, so
+        `SkuID`/`PkuID` are `0` and `OnHand` is NULL — the query cannot match
+        anything useful. Populate all three from the query string.
+      parameters:
+        - name: sku_id
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - name: pku_id
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - name: on_hand
+          in: query
+          required: true
+          description: Minimum unreserved quantity, in the SKU's `base_uom`.
+          schema:
+            $ref: "#/components/schemas/Quantity"
+      responses:
+        "200":
+          description: Reservable balances.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/InventoryBalance"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inventory/balances/lock:
+    post:
+      tags: [Inventory Balances]
+      operationId: lockBalanceForUpdate
+      summary: Select a balance row `FOR UPDATE`
+      description: |
+        Returns the narrow projection needed for a mutation: `id`, `onHand`,
+        `packageCount`, `allocated` and `version`. The row lock is only held for
+        the life of the enclosing transaction, so this endpoint is only useful
+        if it runs inside one — the current design has no unit-of-work layer
+        (`Queries.WithTx` is never called).
+
+        `lotId` must be sent explicitly: the query uses
+        `lot_id IS NOT DISTINCT FROM $3`, so `null` means "balance with no lot"
+        and **will not** match lot-tracked stock.
+      x-handler: InventoryHandler.LockBalanceForUpdate
+      x-handler-gap: |
+        The handler binds the `{id}` path value to `NodeID` and never sets `PkuID`,
+        `LotID` or `IsSealed`. The contract below (JSON body, no path param) is what
+        `LockBalanceForUpdate` actually needs — rewrite the handler to match.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BalanceLockRequest"
+      responses:
+        "200":
+          description: Locked balance row.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalanceLock"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inventory/balances/{id}/allocation:
+    patch:
+      tags: [Inventory Balances]
+      operationId: updateBalanceAllocation
+      summary: Increase the reserved quantity on a balance
+      description: |
+        Adds `allocated` to the balance's reserved quantity, guarded by both the
+        optimistic-concurrency `version` and `chk_allocated_le_on_hand`
+        (`on_hand - allocated - delta >= 0`). Executes via `:execrows`, so the
+        endpoint has **no response body** — a `200` means the row was updated, and
+        a `500` means either the version was stale or there was insufficient
+        unreserved stock. Read the row with `lockBalanceForUpdate` afterwards if
+        you need the new `version`.
+      x-handler: InventoryHandler.UpdateBalanceAllocation
+      x-handler-gap: |
+        The handler writes the sqlc result (an `int64` row count) as the JSON body
+        via `shared.WriteJSON`, producing a bare number. Return `204 No Content`
+        instead, or re-read the balance and return it.
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BalanceAllocationUpdate"
+      responses:
+        "200":
+          description: Balance reserved. Body is currently the affected row count.
+          content:
+            application/json:
+              schema:
+                type: integer
+                format: int64
+                example: 1
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inventory/balances/project/destination-addition:
+    post:
+      tags: [Inventory Balances]
+      operationId: projectDestinationAddition
+      summary: Upsert stock into a destination node
+      description: |
+        Upserts on `(node_id, pku_id, lot_id, is_sealed)` (`NULLS NOT DISTINCT`),
+        adding to `on_hand` and `packageCount` and bumping `version`. This is a
+        ledger primitive: pair it with an `InsertMovement` of reason `PUTAWAY` or
+        `RECEIVING` in the same transaction so the double-entry record exists.
+      x-handler: InventoryHandler.ProjectDestinationAddition
+      x-handler-gap: |
+        The handler responds with a bare `200` because the query is `:exec`.
+        Combine this with `InsertMovement` into a single `POST /movements` call
+        rather than exposing the two halves independently.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DestinationAddition"
+      responses:
+        "200":
+          description: Destination balance upserted. No response body.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inventory/balances/project/source-deduction:
+    post:
+      tags: [Inventory Balances]
+      operationId: projectSourceDeduction
+      summary: Deduct stock from a source balance
+      description: |
+        Subtracts `on_hand` and `package_count`, guarded by `version`. Executes via
+        `:execrows`, so the handler currently responds with a bare row count — a
+        `0` means the version was stale.
+      x-handler: InventoryHandler.ProjectSourceDeduction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SourceDeduction"
+      responses:
+        "200":
+          description: Rows updated — `0` indicates a stale `version`.
+          content:
+            application/json:
+              schema:
+                type: integer
+                format: int64
+                example: 1
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ------------------------------------------------- Inventory Allocations ---
+  /api/v1/inventory/allocations:
+    post:
+      tags: [Inventory Allocations]
+      operationId: createAllocation
+      summary: Reserve stock against an outbound order line
+      description: |
+        Creates the reservation row linking an `outbound_order_lines` row to a
+        concrete `inventory_balances` row. **This endpoint does not move stock** —
+        it does not touch `inventory_balances.allocated`. To keep the balance
+        consistent you must also call
+        `PATCH /api/v1/inventory/balances/{id}/allocation` with the same
+        `version`, in the same transaction. `(order_line_id, balance_id)` is
+        unique.
+      x-handler: InventoryHandler.CreateAllocation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AllocationCreate"
+      responses:
+        "201":
+          description: Allocation created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Allocation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inventory/allocations/order-line/{order_line_id}:
+    get:
+      tags: [Inventory Allocations]
+      operationId: getAllocationsByOrderLine
+      summary: List allocations of an outbound order line
+      description: "The reservation breakdown for a line — how much comes from which balance."
+      x-handler: InventoryHandler.GetAllocationsByOrderLine
+      parameters:
+        - name: order_line_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Allocations.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Allocation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inventory/allocations/{id}/picked:
+    patch:
+      tags: [Inventory Allocations]
+      operationId: incrementAllocationPicked
+      summary: Report picked quantity against an allocation
+      description: |
+        Adds `PickedQuantity` to `picked_quantity`, guarded by `chk_picked_le_allocated`
+        (`picked + delta <= allocated`). Executing via `:one`, a rejected
+        over-pick yields sqlc `ErrNoRows` which surfaces as `500`; it should be
+        `409`.
+      x-handler: InventoryHandler.IncrementAllocationPicked
+      x-handler-gap: |
+        The handler binds the body into `IncrementAllocationPickedParams`, which
+        includes the `id` field — so today `id` comes from the **body**, not the
+        path. Change the handler to set `params.ID` from `PathValue("id")`.
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [PickedQuantity]
+              properties:
+                PickedQuantity:
+                  allOf:
+                    - $ref: "#/components/schemas/Quantity"
+                  description: Quantity picked now, in `base_uom`. Cumulative total must not exceed `allocated_quantity`.
+      responses:
+        "200":
+          description: Allocation updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Allocation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inventory/allocations/{id}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    delete:
+      tags: [Inventory Allocations]
+      operationId: deleteAllocation
+      summary: Release a reservation
+      description: |
+        Deletes the allocation row. Like `createAllocation`, this does **not**
+        decrement `inventory_balances.allocated` — pair it with a negative
+        `PATCH /api/v1/inventory/balances/{balance_id}/allocation`.
+      x-handler: InventoryHandler.DeleteAllocation
+      responses:
+        "204":
+          description: Allocation released.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ---------------------------------------------------- Inventory Movements ---
+  /api/v1/inventory/movements:
+    post:
+      tags: [Inventory Movements]
+      operationId: insertMovement
+      summary: Append a movement to the inventory ledger
+      description: |
+        `inventory_movements` is an immutable append-only double-entry ledger; there
+        is no update or delete endpoint and there never will be. Database
+        constraints enforce:
+
+        - `source_node_id` and `destination_node_id` must differ
+        - at least one of the two must be non-null
+        - `allocation_id` is only permitted when `reason = 'PICK'`
+        - `is_sealed` must be consistent with `package_count`
+          (`chk_unsealed_no_packages`)
+
+        A single movement row represents **both** legs of a transfer. Pair it with
+        `project/source-deduction` and `project/destination-addition` in one
+        transaction.
+      x-handler: InventoryHandler.InsertMovement
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MovementCreate"
+      responses:
+        "201":
+          description: Movement appended.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Movement"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inventory/movements/node/{node_id}:
+    get:
+      tags: [Inventory Movements]
+      operationId: listMovementsByNode
+      summary: List movements touching a node
+      description: |
+        Returns rows where the node is **either** the source **or** the
+        destination, newest first.
+      x-handler: InventoryHandler.ListMovementsByNode
+      x-handler-gap: |
+        The handler sets only `SourceNodeID`, leaving `Limit`/`Offset` at `0`, so
+        the SQL `LIMIT 0 OFFSET 0` always returns an **empty array**. Parse
+        `limit`/`offset` from the query string as the other list handlers do.
+      parameters:
+        - $ref: "#/components/parameters/NodeIdPath"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Movements, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Movement"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inventory/movements/sku/{sku_id}:
+    get:
+      tags: [Inventory Movements]
+      operationId: listMovementsBySku
+      summary: List movements of a SKU
+      description: Full movement history for one SKU, newest first.
+      x-handler: InventoryHandler.ListMovementsBySKU
+      x-handler-gap: |
+        The handler parses `limit`/`offset` but **never sets `SkuID`**, so it
+        filters on `sku_id = 0` and returns nothing. Read the value from
+        `PathValue("sku_id")` and divide by 10 to strip the Luhn check digit.
+      parameters:
+        - $ref: "#/components/parameters/SkuIdPath"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Movements, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Movement"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # -------------------------------------------------------- Inbound Orders ---
+  /api/v1/inbound-orders:
+    post:
+      tags: [Inbound Orders]
+      operationId: createInboundOrder
+      summary: Create an inbound order
+      x-handler: InboundOrderHandler.CreateInboundOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboundOrderCreate"
+      responses:
+        "201":
+          description: Inbound order created with `version = 1`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundOrder"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      tags: [Inbound Orders]
+      operationId: listInboundOrders
+      summary: List inbound orders
+      description: '**No handler exists.** No `ListInboundOrders` query exists either — add both the SQL and the handler.'
+      x-handler: null
+      x-handler-gap: SQL query, handler and route all missing.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Inbound orders.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/InboundOrder"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/inbound-orders/{id}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    get:
+      tags: [Inbound Orders]
+      operationId: getInboundOrderById
+      summary: Get an inbound order by id
+      x-handler: InboundOrderHandler.GetInboundOrderByID
+      responses:
+        "200":
+          description: Inbound order found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundOrder"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Inbound Orders]
+      operationId: deleteInboundOrder
+      summary: Delete an inbound order
+      description: |
+        CASCADE removes the order's lines, but receipts are `ON DELETE RESTRICT`,
+        so an order that has been received against cannot be deleted.
+      x-handler: InboundOrderHandler.DeleteInboundOrder
+      responses:
+        "204":
+          description: Inbound order deleted.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inbound-orders/by-po-number/{po_number}:
+    get:
+      tags: [Inbound Orders]
+      operationId: getInboundOrderByPoNumber
+      summary: Get an inbound order by purchase order number
+      x-handler: InboundOrderHandler.GetInboundOrderByPONumber
+      parameters:
+        - name: po_number
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Inbound order found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundOrder"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/inbound-orders/{id}/lines:
+    post:
+      tags: [Inbound Orders]
+      operationId: createInboundOrderLine
+      summary: Add a line to an inbound order
+      description: |
+        `received_quantity` is hard-coded to `0` by the query. `(pku_id, sku_id)`
+        is a composite FK, which prevents mixing a packaging unit across SKUs.
+      x-handler: InboundOrderHandler.CreateInboundOrderLine
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboundOrderLineCreate"
+      responses:
+        "201":
+          description: Line created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundOrderLine"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      tags: [Inbound Orders]
+      operationId: getInboundOrderLines
+      summary: List lines of an inbound order
+      description: Joined with SKU and packaging unit — each row carries `skuUuid`, `skuName` and `unitName`.
+      x-handler: InboundOrderHandler.GetInboundOrderLines
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Inbound order lines.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/InboundOrderLineRow"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inbound-orders/{id}/lines/{line_id}/received:
+    post:
+      tags: [Inbound Orders]
+      operationId: incrementInboundLineReceived
+      summary: Report received quantity against a line
+      x-handler: InboundOrderHandler.IncrementInboundLineReceived
+      x-handler-gap: |
+        The handler builds `IncrementInboundLineReceivedParams{ID: id}` and
+        **discards `ReceivedQuantity` from the request body entirely**, so the SQL
+        receives NULL for `$2`. Add
+        `var body struct{ ReceivedQuantity pgtype.Numeric }` +
+        `shared.ReadJSON` and assign it.
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+        - name: line_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ReceivedQuantity]
+              properties:
+                ReceivedQuantity:
+                  allOf:
+                    - $ref: "#/components/schemas/Quantity"
+                  description: Quantity received in this delivery, in `base_uom`.
+      responses:
+        "200":
+          description: Line updated with the new cumulative `received_quantity`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundOrderLine"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/inbound-orders/{id}/status:
+    patch:
+      tags: [Inbound Orders]
+      operationId: updateInboundOrderStatus
+      summary: Transition an inbound order's status
+      description: |
+        Guarded by `WHERE id = $1 AND version = $3`. Intended transitions:
+
+        ```
+        DRAFT -> ISSUED -> PARTIALLY_RECEIVED -> RECEIVED
+                                 |                     |
+                                 +------ CANCELLED <----+
+        ```
+
+        A `Version` mismatch returns no rows from sqlc, which the handler reports
+        as `500`. Surface this as `409 Conflict` and return the current version.
+      x-handler: InboundOrderHandler.UpdateInboundOrderStatus
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [Status, Version]
+              properties:
+                Status:
+                  $ref: "#/components/schemas/InboundOrderStatus"
+                Version:
+                  type: integer
+                  format: int32
+                  description: The `version` the client last read. Required for optimistic concurrency.
+      responses:
+        "200":
+          description: Status transitioned; `version` incremented.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundOrder"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # -------------------------------------------------------------- Receipts ---
+  /api/v1/inbound-orders/{id}/receipts:
+    post:
+      tags: [Receipts]
+      operationId: createReceipt
+      summary: Open a goods receipt against an inbound order
+      description: |
+        A receipt is the physical event; its lines are what actually increase stock.
+        Open with `Status: RECEIVING`, post the lines, then flip to `COMPLETED` —
+        which should be the point at which `project/destination-addition` and a
+        `RECEIVING` movement are committed.
+      x-handler: InboundOrderHandler.CreateReceipt
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReceiptCreate"
+      responses:
+        "201":
+          description: Receipt created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Receipt"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/receipts/{id}/lines:
+    post:
+      tags: [Receipts]
+      operationId: createReceiptLine
+      summary: Add a line to a receipt
+      x-handler: InboundOrderHandler.CreateReceiptLine
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReceiptLineCreate"
+      responses:
+        "201":
+          description: Receipt line created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReceiptLine"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/receipts/{id}/status:
+    patch:
+      tags: [Receipts]
+      operationId: updateReceiptStatus
+      summary: Transition a receipt's status
+      description: '`RECEIVING -> COMPLETED` or `RECEIVING -> CANCELLED`. No optimistic-concurrency guard on this table.'
+      x-handler: InboundOrderHandler.UpdateReceiptStatus
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [Status]
+              properties:
+                Status:
+                  $ref: "#/components/schemas/ReceiptStatus"
+      responses:
+        "200":
+          description: Receipt status updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Receipt"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # -------------------------------------------------------- Outbound Orders ---
+  /api/v1/outbound-orders:
+    post:
+      tags: [Outbound Orders]
+      operationId: createOutboundOrder
+      summary: Create an outbound order
+      x-handler: OutboundOrderHandler.CreateOutboundOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OutboundOrderCreate"
+      responses:
+        "201":
+          description: Outbound order created with `version = 1`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OutboundOrder"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      tags: [Outbound Orders]
+      operationId: listOutboundOrdersByStatus
+      summary: List outbound orders by status
+      description: Ordered by `priority` descending then `createdAt` ascending — highest priority and oldest first, which is the natural work queue.
+      x-handler: OutboundOrderHandler.ListOrdersByStatus
+      x-handler-gap: |
+        `ListOrdersByStatusParams` requires `Status` (`WHERE status = $1`) but the
+        handler only sets `Limit` and `Offset`, so `status` is the empty string and
+        the query returns nothing. Make `status` a **required** query parameter
+        and parse it into `params.Status`.
+      parameters:
+        - name: status
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/OrderStatus"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Outbound orders in the requested status.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/OutboundOrder"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/outbound-orders/{id}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    get:
+      tags: [Outbound Orders]
+      operationId: getOutboundOrderById
+      summary: Get an outbound order by id
+      x-handler: OutboundOrderHandler.GetOutboundOrderByID
+      responses:
+        "200":
+          description: Outbound order found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OutboundOrder"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Outbound Orders]
+      operationId: deleteOutboundOrder
+      summary: Delete an outbound order
+      description: |
+        CASCADE removes the order's lines and allocations. Handling units are
+        `ON DELETE RESTRICT`, so a packed order cannot be deleted.
+      x-handler: OutboundOrderHandler.DeleteOutboundOrder
+      responses:
+        "204":
+          description: Outbound order deleted.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/outbound-orders/by-order-number/{order_number}:
+    get:
+      tags: [Outbound Orders]
+      operationId: getOutboundOrderByNumber
+      summary: Get an outbound order by order number
+      x-handler: OutboundOrderHandler.GetOutboundOrderByNumber
+      parameters:
+        - name: order_number
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Outbound order found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OutboundOrder"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/outbound-orders/{id}/lines:
+    post:
+      tags: [Outbound Orders]
+      operationId: createOutboundOrderLine
+      summary: Add a line to an outbound order
+      description: |
+        `fulfilled_quantity` is hard-coded to `0`. `(order_id, pku_id)` is unique,
+        so the same packaging unit cannot appear twice on one order — order the
+        same SKU at two packaging units (e.g. `EACH` and `CASE` of 12) instead.
+      x-handler: OutboundOrderHandler.CreateOutboundOrderLine
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OutboundOrderLineCreate"
+      responses:
+        "201":
+          description: Line created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OutboundOrderLine"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      tags: [Outbound Orders]
+      operationId: getOutboundOrderLines
+      summary: List lines of an outbound order
+      x-handler: OutboundOrderHandler.GetOutboundOrderLines
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Outbound order lines with SKU and packaging unit details.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/OutboundOrderLineRow"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/outbound-orders/{id}/lines/{line_id}/fulfillment:
+    post:
+      tags: [Outbound Orders]
+      operationId: incrementOrderLineFulfillment
+      summary: Report fulfilled quantity against a line
+      description: |
+        Adds `FulfilledQuantity`, guarded by `chk_fulfillment_bounds`
+        (`fulfilled + delta <= requested`). sqlc `:one` returns `ErrNoRows` when
+        the guard rejects the write, which the handler surfaces as `500`; it should
+        be `409`.
+      x-handler: OutboundOrderHandler.IncrementOrderLineFulfillment
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+        - name: line_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [FulfilledQuantity]
+              properties:
+                FulfilledQuantity:
+                  allOf:
+                    - $ref: "#/components/schemas/Quantity"
+                  description: Quantity fulfilled in this step, in `base_uom`. Cumulative total must not exceed `requested_quantity`.
+      responses:
+        "200":
+          description: Line updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OutboundOrderLine"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/outbound-orders/{id}/status:
+    patch:
+      tags: [Outbound Orders]
+      operationId: updateOutboundOrderStatus
+      summary: Transition an outbound order's status
+      description: |
+        Guarded by `WHERE id = $1 AND version = $3`. Intended transitions:
+
+        ```
+        PENDING -> ALLOCATED -> PICKING -> PACKED -> SHIPPED
+             |         |         |         |          |
+             +---------+---------+---------+---> CANCELLED (any pre-SHIPPED)
+        ```
+
+        `PARTIALLY_ALLOCATED` is reachable from `ALLOCATED` when only some lines
+        could be satisfied. A `Version` mismatch should be `409`.
+      x-handler: OutboundOrderHandler.UpdateOutboundOrderStatus
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [Status, Version]
+              properties:
+                Status:
+                  $ref: "#/components/schemas/OrderStatus"
+                Version:
+                  type: integer
+                  format: int32
+                  description: The `version` the client last read. Required for optimistic concurrency.
+      responses:
+        "200":
+          description: Status transitioned; `version` incremented.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OutboundOrder"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # -------------------------------------- Handling Units & Shipments --------
+  /api/v1/handling-units:
+    post:
+      tags: [Handling Units & Shipments]
+      operationId: createHandlingUnit
+      summary: Create a handling unit (pallet / carton / tote)
+      description: |
+        A handling unit is the **physical, reusable** container that travels with
+        the goods — deliberately distinct from a packaging unit, which is a
+        consumable/disposable measure of content. `sscc` is the GS1 Serial Shipping
+        Container Code.
+      x-handler: OutboundOrderHandler.CreateHandlingUnit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HandlingUnitCreate"
+      responses:
+        "201":
+          description: Handling unit created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HandlingUnit"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/handling-units/{handling_unit_id}/contents:
+    post:
+      tags: [Handling Units & Shipments]
+      operationId: packHandlingUnitContent
+      summary: Pack an allocation into a handling unit
+      x-handler: OutboundOrderHandler.PackHandlingUnitContent
+      x-handler-gap: |
+        The handler reads `handling_unit_id` from the **request body** rather than
+        the path, and discards the returned `HandlingUnitContent`, responding with
+        a bare `200`. Read `PathValue("handling_unit_id")` into
+        `params.HandlingUnitID` and return `201` with the created row.
+      parameters:
+        - name: handling_unit_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [AllocationID, PackedQuantity]
+              properties:
+                AllocationID:
+                  type: integer
+                  format: int64
+                  description: Allocation being packed.
+                PackedQuantity:
+                  allOf:
+                    - $ref: "#/components/schemas/Quantity"
+                  description: Quantity placed in this handling unit, in `base_uom`.
+      responses:
+        "201":
+          description: Content packed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HandlingUnitContent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/handling-units/{handling_unit_id}/shipment:
+    put:
+      tags: [Handling Units & Shipments]
+      operationId: assignHandlingUnitToShipment
+      summary: Assign a handling unit to a shipment
+      description: |
+        Sets `shipment_id` and optionally a per-unit `tracking_number`. A shipment
+        may contain many handling units, each with its own tracking number under
+        a shared `master_tracking_number`.
+      x-handler: null
+      x-handler-gap: Handler and route missing (`AssignHandlingUnitToShipment` is generated but uncalled). No shipment status transition exists — `shipments.status` can only be set at creation.
+      parameters:
+        - name: handling_unit_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssignShipment"
+      responses:
+        "200":
+          description: Handling unit assigned. No response body.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/shipments:
+    post:
+      tags: [Handling Units & Shipments]
+      operationId: createShipment
+      summary: Create a shipment
+      x-handler: OutboundOrderHandler.CreateShipment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ShipmentCreate"
+      responses:
+        "201":
+          description: Shipment created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Shipment"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # --------------------------------------------------------- Warehouse Tasks --
+  /api/v1/tasks:
+    post:
+      tags: [Warehouse Tasks]
+      operationId: createWarehouseTask
+      summary: Create a work task for an operator
+      description: |
+        Tasks are the operator-facing work queue. The whole tasks domain has
+        **zero HTTP surface today** — there is no `internal/tasks` package and no
+        handler calls any of `CreateWarehouseTask`, `ListPendingTasks`,
+        `AssignTask`, `CompleteTask` or `CancelTask`.
+
+        Which fields are meaningful depends on `taskType`:
+
+        | Task type | Populated fields |
+        |---|---|
+        | `PUTAWAY` | `skuId`, `pkuId`, `lotId`, `packageCount`, `quantity`, `sourceNodeId`, `targetNodeId` |
+        | `PICK` | `skuId`, `pkuId`, `lotId`, `quantity`, `sourceNodeId`, `destinationNodeId`, `orderLineId`, `allocationId` |
+        | `REPLENISH` | `skuId`, `pkuId`, `quantity`, `sourceNodeId`, `targetNodeId` |
+        | `COUNT` | `skuId`, `pkuId`, `lotId`, `targetNodeId` |
+        | `RELOCATE_NODE` | `sourceNodeId`, `targetNodeId` |
+      x-handler: null
+      x-handler-gap: Handler and route missing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WarehouseTaskCreate"
+      responses:
+        "201":
+          description: Task created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WarehouseTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      tags: [Warehouse Tasks]
+      operationId: listPendingTasks
+      summary: List pending work tasks
+      description: |
+        The dispatch queue: `status = 'PENDING'` ordered by `priority` descending
+        then `createdAt` ascending. The query takes a single `limit` with **no
+        offset**, so this is a peek at the head of the queue rather than a paginated
+        listing.
+      x-handler: null
+      x-handler-gap: Handler and route missing.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            default: 100
+            maximum: 500
+      responses:
+        "200":
+          description: Pending tasks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WarehouseTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/tasks/{id}:
+    get:
+      tags: [Warehouse Tasks]
+      operationId: getWarehouseTaskById
+      summary: Get a task by id
+      x-handler: null
+      x-handler-gap: Handler and route missing.
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Task found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WarehouseTask"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/tasks/{id}/assign:
+    post:
+      tags: [Warehouse Tasks]
+      operationId: assignTask
+      summary: Assign a task to an operator
+      description: |
+        `PENDING -> ASSIGNED`, guarded by `AND status = 'PENDING'`. The guard makes
+        this safe against two dispatchers racing for the same task: the loser gets
+        no rows back and should be told `409`.
+      x-handler: null
+      x-handler-gap: Handler and route missing.
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [AssignedOperatorID]
+              properties:
+                AssignedOperatorID:
+                  type: string
+      responses:
+        "200":
+          description: Task assigned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WarehouseTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tasks/{id}/complete:
+    post:
+      tags: [Warehouse Tasks]
+      operationId: completeTask
+      summary: Complete a task
+      description: |
+        `ASSIGNED | IN_PROGRESS -> COMPLETED`, stamping `completed_at`. **Nothing
+        here writes to the inventory ledger** — completing a `PUTAWAY` task does
+        not deduct from the source balance. The task endpoints and the movement
+        endpoints must be composed by the caller inside one transaction.
+      x-handler: null
+      x-handler-gap: Handler and route missing.
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Task completed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WarehouseTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/tasks/{id}/cancel:
+    post:
+      tags: [Warehouse Tasks]
+      operationId: cancelTask
+      summary: Cancel a task
+      description: Any status except `COMPLETED` may be cancelled.
+      x-handler: null
+      x-handler-gap: Handler and route missing.
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Task cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WarehouseTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      description: Primary key.
+      schema:
+        type: integer
+        format: int64
+
+    LuhnIdPath:
+      name: id
+      in: path
+      required: true
+      description: 'Luhn-encoded SKU id (`internal_id * 10 + check_digit`). Rejected with 400 when the check digit does not verify.'
+      schema:
+        type: integer
+        format: int64
+        example: 100000
+
+    SkuIdPath:
+      name: sku_id
+      in: path
+      required: true
+      description: 'Luhn-encoded SKU id (`internal_id * 10 + check_digit`). Rejected with 400 when the check digit does not verify.'
+      schema:
+        type: integer
+        format: int64
+        example: 100000
+
+    NodeIdPath:
+      name: node_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum rows. Invalid values are logged and replaced with the default.
+      schema:
+        type: integer
+        format: int32
+        default: 100
+        maximum: 500
+
+    Offset:
+      name: offset
+      in: query
+      required: false
+      description: Rows to skip. Invalid values are logged and replaced with the default.
+      schema:
+        type: integer
+        format: int32
+        default: 0
+        minimum: 0
+
+  responses:
+    BadRequest:
+      description: |
+        Malformed request: unparseable JSON, a non-numeric path parameter, or a
+        path parameter that fails the Luhn checksum.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: 'invalid sku id: must be numeric and satisfy luhn checksum'
+
+    NotFound:
+      description: No row matched the supplied identifier.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: 'no rows in result set'
+
+    InternalError:
+      description: |
+        The database call failed. Also returned — incorrectly — for
+        optimistic-concurrency version mismatches and for constraint violations
+        raised by the ledger's guard checks, all of which should be `409` or `422`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: 'ERROR: new row violates check constraint "chk_picked_le_allocated"'
+
+  schemas:
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          description: The raw Go/Postgres error string. Not yet structured or localised.
+      example:
+        message: not found
+
+    Quantity:
+      description: |
+        A PostgreSQL `NUMERIC` bound as `pgtype.Numeric`. Serialises as a bare JSON
+        number (`12.500`); accepts a number, a quoted string, or `null` on input.
+        **Always in the SKU's `base_uom`.**
+      oneOf:
+        - type: number
+        - type: string
+      example: 12.5
+
+    NullableQuantity:
+      description: |
+        A `pgtype.Numeric` that may be SQL NULL — used by the partial-update
+        request bodies, where an omitted or `null` field means "leave this column
+        alone" (`COALESCE` in the SQL).
+
+        `pgtype.Numeric.UnmarshalJSON` accepts `null`, a bare JSON number, or a
+        quoted string; the quoted string is declared here because it is the
+        unambiguous form for a client that may legitimately send `null`.
+      type: string
+      nullable: true
+      example: null
+
+    # ------------------------------------------------------------- SKUs ------
+    SKU:
+      type: object
+      required: [ID, Name, BaseUom, IsDiscrete, RequiresLotTracking]
+      properties:
+        ID:
+          type: integer
+          format: int64
+          description: Luhn-encoded id — `internal_id * 10 + check_digit`. Starts at `100000`.
+          example: 100000
+        Name:
+          type: string
+        BaseUom:
+          $ref: "#/components/schemas/Uom"
+        IsDiscrete:
+          type: boolean
+          description: True for countable goods (`EACH`), false for continuous materials.
+        RequiresLotTracking:
+          type: boolean
+          description: True when the SKU must carry a lot (expiry, batch, recall).
+        TenantID:
+          type: integer
+          format: int64
+          nullable: true
+          description: Reserved for multi-tenancy. Never written or filtered on by the current code.
+        Attributes:
+          type: string
+          nullable: true
+          description: Free-form JSONB blob, base64-encoded because it is bound as `[]byte`.
+          example: eyJjb2xvciI6InJlZCJ9
+        CreatedAt:
+          type: string
+          format: date-time
+
+    SKUCreate:
+      type: object
+      required: [Name, BaseUom, IsDiscrete, RequiresLotTracking]
+      properties:
+        Name:
+          type: string
+          example: M8 Hex Bolt
+        BaseUom:
+          $ref: "#/components/schemas/Uom"
+        IsDiscrete:
+          type: boolean
+          example: true
+        RequiresLotTracking:
+          type: boolean
+          example: false
+        Attributes:
+          type: string
+          nullable: true
+          description: Free-form JSONB as a string, base64-decoded by `encoding/json` into `[]byte`.
+
+    SKUUpdate:
+      type: object
+      description: All fields optional. Send `null`/omit to leave a column unchanged (`COALESCE`).
+      properties:
+        Name:
+          type: string
+          nullable: true
+        IsDiscrete:
+          type: boolean
+          nullable: true
+        RequiresLotTracking:
+          type: boolean
+          nullable: true
+        Attributes:
+          type: string
+          nullable: true
+
+    # -------------------------------------------------- Packaging units -----
+    PackagingUnit:
+      type: object
+      required: [ID, SkuID, UnitName, IsBaseUnit, AllowsBreakBulk]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        SkuID:
+          type: integer
+          format: int64
+          description: Luhn-encoded.
+        UnitName:
+          type: string
+          example: CASE
+        ConversionFactor:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: How many `base_uom` units one container holds. Must be exactly `1.0000` when `IsBaseUnit` is true.
+        ParentPackagingUnitID:
+          type: integer
+          format: int64
+          nullable: true
+          description: Self-referencing FK — builds the `EACH -> CASE -> PALLET` hierarchy.
+        IsBaseUnit:
+          type: boolean
+          description: True for the `base_uom` container. A SKU may have at most one.
+        AllowsBreakBulk:
+          type: boolean
+          description: True when this container may be opened (`BREAK_PACKAGE`) to fulfil part of an order.
+        Barcode:
+          type: string
+          nullable: true
+          description: Globally unique across all packaging units.
+        TareWeightKg:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Empty-container weight.
+        GrossVolumeCm3:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Capacity of the empty container.
+
+    PackagingUnitCreate:
+      type: object
+      required: [SkuID, UnitName, ConversionFactor]
+      properties:
+        SkuID:
+          type: integer
+          format: int64
+          description: Luhn-encoded SKU id. The handler validates and strips the check digit.
+        UnitName:
+          type: string
+        ConversionFactor:
+          $ref: "#/components/schemas/Quantity"
+        ParentPackagingUnitID:
+          type: integer
+          format: int64
+          nullable: true
+        IsBaseUnit:
+          type: boolean
+          default: false
+        AllowsBreakBulk:
+          type: boolean
+          default: false
+        Barcode:
+          type: string
+          nullable: true
+        TareWeightKg:
+          $ref: "#/components/schemas/Quantity"
+        GrossVolumeCm3:
+          $ref: "#/components/schemas/Quantity"
+
+    PackagingUnitUpdate:
+      type: object
+      description: All fields optional (`COALESCE`). `SkuID`, `ParentPackagingUnitID` and `IsBaseUnit` are not editable.
+      properties:
+        UnitName:
+          type: string
+          nullable: true
+        ConversionFactor:
+          $ref: "#/components/schemas/NullableQuantity"
+        AllowsBreakBulk:
+          type: boolean
+          nullable: true
+        Barcode:
+          type: string
+          nullable: true
+        TareWeightKg:
+          $ref: "#/components/schemas/NullableQuantity"
+        GrossVolumeCm3:
+          $ref: "#/components/schemas/NullableQuantity"
+
+    # -------------------------------------------------------------- Lots -----
+    Lot:
+      type: object
+      required: [ID, SkuID, LotNumber, Status]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        SkuID:
+          type: integer
+          format: int64
+          description: Luhn-encoded.
+        LotNumber:
+          type: string
+          example: L-2026-0412
+        Status:
+          $ref: "#/components/schemas/LotStatus"
+        ManufacturedAt:
+          type: string
+          format: date
+          nullable: true
+        ExpiresAt:
+          type: string
+          format: date
+          nullable: true
+          description: Drives FEFO ordering in `ListLotsBySKU` and `FindReservableBalances`.
+        ReceivedAt:
+          type: string
+          format: date-time
+
+    LotCreate:
+      type: object
+      required: [SkuID, LotNumber]
+      properties:
+        SkuID:
+          type: integer
+          format: int64
+          description: Luhn-encoded.
+        LotNumber:
+          type: string
+        Status:
+          allOf:
+            - $ref: "#/components/schemas/LotStatus"
+          default: AVAILABLE
+        ManufacturedAt:
+          type: string
+          format: date
+          nullable: true
+        ExpiresAt:
+          type: string
+          format: date
+          nullable: true
+
+    # ----------------------------------------------------- Storage nodes -----
+    StorageNode:
+      type: object
+      required: [ID, Code, NodeType, IsMovable, IsActive]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        ParentID:
+          type: integer
+          format: int64
+          nullable: true
+          description: Null for top-level nodes.
+        Path:
+          type: string
+          description: |
+            Materialised `ltree` path, e.g. `1.4.19`. Derived by the server on
+            create and rewritten wholesale on reparent. Not writable by clients.
+          example: 1.4.19
+        Code:
+          type: string
+          description: Unique across all nodes.
+          example: BIN-A12-03
+        NodeType:
+          $ref: "#/components/schemas/StorageNodeType"
+        IsMovable:
+          type: boolean
+          description: False pins a node (e.g. a receiving dock) against relocation.
+        MaxWeightKg:
+          $ref: "#/components/schemas/NullableQuantity"
+        MaxVolumeCm3:
+          $ref: "#/components/schemas/NullableQuantity"
+        IsActive:
+          type: boolean
+        CreatedAt:
+          type: string
+          format: date-time
+
+    StorageNodeCreate:
+      type: object
+      required: [Code, NodeType]
+      properties:
+        ParentID:
+          type: integer
+          format: int64
+          nullable: true
+          description: Omit to create a top-level node.
+        Code:
+          type: string
+        NodeType:
+          $ref: "#/components/schemas/StorageNodeType"
+        IsMovable:
+          type: boolean
+          default: true
+        MaxWeightKg:
+          $ref: "#/components/schemas/Quantity"
+        MaxVolumeCm3:
+          $ref: "#/components/schemas/Quantity"
+        IsActive:
+          type: boolean
+          default: true
+
+    StorageNodeUpdate:
+      type: object
+      description: All fields optional (`COALESCE`). Does not include `parentId`, `nodeType` or `path`.
+      properties:
+        Code:
+          type: string
+          nullable: true
+        IsMovable:
+          type: boolean
+          nullable: true
+        MaxWeightKg:
+          $ref: "#/components/schemas/NullableQuantity"
+        MaxVolumeCm3:
+          $ref: "#/components/schemas/NullableQuantity"
+        IsActive:
+          type: boolean
+          nullable: true
+
+    NodeRelocation:
+      type: object
+      properties:
+        ID:
+          type: integer
+          format: int64
+        NodeID:
+          type: integer
+          format: int64
+        FromParentID:
+          type: integer
+          format: int64
+          nullable: true
+        ToParentID:
+          type: integer
+          format: int64
+          nullable: true
+        FromPath:
+          type: string
+          example: '1.4'
+        ToPath:
+          type: string
+          example: '1.9'
+        OperatorID:
+          type: string
+        CreatedAt:
+          type: string
+          format: date-time
+
+    NodeRelocationCreate:
+      type: object
+      required: [FromParentID, ToParentID, FromPath, ToPath, OperatorID]
+      properties:
+        FromParentID:
+          type: integer
+          format: int64
+          nullable: true
+        ToParentID:
+          type: integer
+          format: int64
+          nullable: true
+        FromPath:
+          type: string
+        ToPath:
+          type: string
+        OperatorID:
+          type: string
+
+    # ---------------------------------------------------- Inventory ---------
+    InventoryBalance:
+      type: object
+      required: [ID, NodeID, SkuID, PkuID, IsSealed, Version]
+      description: |
+        One stock position: a single `(node, sku, packaging unit, lot, sealed)` tuple.
+        Uniqueness is enforced on `(node_id, pku_id, lot_id, is_sealed)` with
+        `NULLS NOT DISTINCT`, and the table runs at `fillfactor = 70` for the
+        hot `version` counter.
+      properties:
+        ID:
+          type: integer
+          format: int64
+        NodeID:
+          type: integer
+          format: int64
+        SkuID:
+          type: integer
+          format: int64
+          description: Raw database id, **not** Luhn-encoded on this endpoint.
+        PkuID:
+          type: integer
+          format: int64
+        LotID:
+          type: integer
+          format: int64
+          nullable: true
+        IsSealed:
+          type: boolean
+          description: True when the stock is contained in an intact, countable package.
+        PackageCount:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Container count. Constrained to `0` when `IsSealed` is false.
+        Version:
+          type: integer
+          format: int32
+          description: Optimistic-concurrency token. Send this back on every mutation.
+        OnHand:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Physical quantity present, in `base_uom`. Must be positive when the row exists.
+        Allocated:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Reserved for outbound orders, in `base_uom`. `Allocated <= OnHand` is enforced.
+        UpdatedAt:
+          type: string
+          format: date-time
+
+    BalanceByNode:
+      allOf:
+        - $ref: "#/components/schemas/InventoryBalance"
+        - type: object
+          description: '`ListBalancesByNode` join projection.'
+          properties:
+            SkuUuid:
+              type: integer
+              format: int64
+              description: Denormalised copy of the SKU id.
+            SkuName:
+              type: string
+            UnitName:
+              type: string
+              description: Denormalised packaging-unit name.
+
+    BalanceLock:
+      type: object
+      description: Narrow projection returned by `SELECT ... FOR UPDATE`.
+      required: [ID, Version]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        OnHand:
+          $ref: "#/components/schemas/Quantity"
+        PackageCount:
+          $ref: "#/components/schemas/Quantity"
+        Allocated:
+          $ref: "#/components/schemas/Quantity"
+        Version:
+          type: integer
+          format: int32
+
+    BalanceLockRequest:
+      type: object
+      required: [NodeID, PkuID, IsSealed]
+      properties:
+        NodeID:
+          type: integer
+          format: int64
+        PkuID:
+          type: integer
+          format: int64
+        LotID:
+          type: integer
+          format: int64
+          nullable: true
+          description: |
+            Must be sent explicitly. The query uses
+            `lot_id IS NOT DISTINCT FROM $3`, so `null` matches only balances with
+            **no** lot and will not match lot-tracked stock.
+        IsSealed:
+          type: boolean
+
+    BalanceAllocationUpdate:
+      type: object
+      required: [Allocated, Version]
+      properties:
+        Allocated:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Delta to add to the reserved quantity. May be negative to release a reservation.
+        Version:
+          type: integer
+          format: int32
+          description: Expected `version`. The update is rejected if stale or if it would over-allocate.
+
+    DestinationAddition:
+      type: object
+      required: [NodeID, SkuID, PkuID, IsSealed, OnHand]
+      properties:
+        NodeID:
+          type: integer
+          format: int64
+        SkuID:
+          type: integer
+          format: int64
+        PkuID:
+          type: integer
+          format: int64
+        LotID:
+          type: integer
+          format: int64
+          nullable: true
+        IsSealed:
+          type: boolean
+        OnHand:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Quantity to add, in `base_uom`.
+        PackageCount:
+          $ref: "#/components/schemas/Quantity"
+
+    SourceDeduction:
+      type: object
+      required: [OnHand, ID, Version]
+      properties:
+        OnHand:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Quantity to subtract, in `base_uom`.
+        PackageCount:
+          $ref: "#/components/schemas/Quantity"
+        ID:
+          type: integer
+          format: int64
+          description: Balance row id.
+        Version:
+          type: integer
+          format: int32
+          description: Expected `version`.
+
+    # --------------------------------------------------- Allocations ---------
+    Allocation:
+      type: object
+      required: [ID, OrderLineID, BalanceID, SkuID]
+      description: Reservation of a slice of one balance against one outbound order line.
+      properties:
+        ID:
+          type: integer
+          format: int64
+        OrderLineID:
+          type: integer
+          format: int64
+          description: '`outbound_order_lines.id`.'
+        BalanceID:
+          type: integer
+          format: int64
+          description: '`inventory_balances.id`. `(OrderLineID, BalanceID)` is unique.'
+        SkuID:
+          type: integer
+          format: int64
+        AllocatedQuantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Reserved quantity, in `base_uom`.
+        PickedQuantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Quantity actually picked so far. Constrained `<= AllocatedQuantity`.
+        CreatedAt:
+          type: string
+          format: date-time
+
+    AllocationCreate:
+      type: object
+      required: [OrderLineID, BalanceID, SkuID, AllocatedQuantity]
+      properties:
+        OrderLineID:
+          type: integer
+          format: int64
+        BalanceID:
+          type: integer
+          format: int64
+          description: Take from `findReservableBalances`.
+        SkuID:
+          type: integer
+          format: int64
+        AllocatedQuantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Quantity to reserve, in `base_uom`.
+
+    # ------------------------------------------------------ Movements --------
+    Movement:
+      type: object
+      required: [ID, SkuID, PkuID, Reason, IsSealed]
+      description: |
+        One row of the immutable double-entry inventory ledger. There is no update
+        or delete; corrections are made by appending a compensating movement.
+      properties:
+        ID:
+          type: integer
+          format: int64
+        SkuID:
+          type: integer
+          format: int64
+        PkuID:
+          type: integer
+          format: int64
+        LotID:
+          type: integer
+          format: int64
+          nullable: true
+        PackageCount:
+          $ref: "#/components/schemas/Quantity"
+        Quantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Moved quantity in `base_uom`.
+        SourceNodeID:
+          type: integer
+          format: int64
+          nullable: true
+          description: Null for inbound-only legs (e.g. `RECEIVING`). Paired-leg semantics are the client's job.
+        DestinationNodeID:
+          type: integer
+          format: int64
+          nullable: true
+          description: Null for outbound-only legs. Must differ from `SourceNodeID`.
+        Reason:
+          $ref: "#/components/schemas/MovementReason"
+        ReferenceID:
+          type: string
+          nullable: true
+          description: Free-form pointer to the driving document (receipt id, task id, allocation id).
+        AllocationID:
+          type: integer
+          format: int64
+          nullable: true
+          description: Only permitted when `Reason` is `PICK`.
+        IsSealed:
+          type: boolean
+        OperatorID:
+          type: string
+        CreatedAt:
+          type: string
+          format: date-time
+
+    MovementCreate:
+      type: object
+      required: [SkuID, PkuID, Quantity, Reason, OperatorID]
+      properties:
+        SkuID:
+          type: integer
+          format: int64
+        PkuID:
+          type: integer
+          format: int64
+        LotID:
+          type: integer
+          format: int64
+          nullable: true
+        PackageCount:
+          $ref: "#/components/schemas/Quantity"
+        Quantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Quantity moved, in `base_uom`.
+        SourceNodeID:
+          type: integer
+          format: int64
+          nullable: true
+        DestinationNodeID:
+          type: integer
+          format: int64
+          nullable: true
+        Reason:
+          $ref: "#/components/schemas/MovementReason"
+        ReferenceID:
+          type: string
+          nullable: true
+        AllocationID:
+          type: integer
+          format: int64
+          nullable: true
+          description: Only when `Reason` is `PICK`.
+        IsSealed:
+          type: boolean
+          default: false
+        OperatorID:
+          type: string
+
+    # ---------------------------------------------------- Inbound orders -----
+    InboundOrder:
+      type: object
+      required: [ID, PoNumber, VendorName, Version, Status]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        PoNumber:
+          type: string
+          example: PO-88213
+        TenantID:
+          type: integer
+          format: int64
+          nullable: true
+        VendorName:
+          type: string
+        Version:
+          type: integer
+          format: int32
+          description: Optimistic-concurrency token. Echo back on every status change.
+        Status:
+          $ref: "#/components/schemas/InboundOrderStatus"
+        ExpectedDelivery:
+          type: string
+          format: date
+          nullable: true
+        CreatedAt:
+          type: string
+          format: date-time
+        UpdatedAt:
+          type: string
+          format: date-time
+
+    InboundOrderCreate:
+      type: object
+      required: [PoNumber, VendorName]
+      properties:
+        PoNumber:
+          type: string
+        VendorName:
+          type: string
+        Status:
+          allOf:
+            - $ref: "#/components/schemas/InboundOrderStatus"
+          default: DRAFT
+        ExpectedDelivery:
+          type: string
+          format: date
+          nullable: true
+
+    InboundOrderLine:
+      type: object
+      required: [ID, InboundOrderID, SkuID, PkuID]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        InboundOrderID:
+          type: integer
+          format: int64
+        SkuID:
+          type: integer
+          format: int64
+        PkuID:
+          type: integer
+          format: int64
+          description: Composite FK `(pku_id, sku_id)` — cannot reference another SKU's packaging unit.
+        ExpectedQuantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Expected in `base_uom`.
+        ReceivedQuantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Cumulative received, in `base_uom`. Initialised to `0` by the query.
+
+    InboundOrderLineCreate:
+      type: object
+      required: [InboundOrderID, SkuID, PkuID, ExpectedQuantity]
+      properties:
+        InboundOrderID:
+          type: integer
+          format: int64
+        SkuID:
+          type: integer
+          format: int64
+        PkuID:
+          type: integer
+          format: int64
+        ExpectedQuantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Expected quantity in `base_uom`.
+
+    InboundOrderLineRow:
+      allOf:
+        - $ref: "#/components/schemas/InboundOrderLine"
+        - type: object
+          description: '`GetInboundOrderLines` join projection.'
+          properties:
+            SkuUuid:
+              type: integer
+              format: int64
+            SkuName:
+              type: string
+            UnitName:
+              type: string
+
+    # --------------------------------------------------------- Receipts -----
+    Receipt:
+      type: object
+      required: [ID, InboundOrderID, ReceiptNumber, Status]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        InboundOrderID:
+          type: integer
+          format: int64
+        ReceiptNumber:
+          type: string
+        Status:
+          $ref: "#/components/schemas/ReceiptStatus"
+        OperatorID:
+          type: string
+        ReceivedAt:
+          type: string
+          format: date-time
+
+    ReceiptCreate:
+      type: object
+      required: [InboundOrderID, ReceiptNumber, OperatorID]
+      properties:
+        InboundOrderID:
+          type: integer
+          format: int64
+        ReceiptNumber:
+          type: string
+        Status:
+          allOf:
+            - $ref: "#/components/schemas/ReceiptStatus"
+          default: RECEIVING
+        OperatorID:
+          type: string
+
+    ReceiptLine:
+      type: object
+      required: [ID, ReceiptID, SkuID, PkuID]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        ReceiptID:
+          type: integer
+          format: int64
+        InboundOrderLineID:
+          type: integer
+          format: int64
+          nullable: true
+          description: Links the receipt back to the expected line; null when receiving an unexpected SKU.
+        SkuID:
+          type: integer
+          format: int64
+        PkuID:
+          type: integer
+          format: int64
+        LotID:
+          type: integer
+          format: int64
+          nullable: true
+          description: Created or matched during receipt when the SKU is lot-tracked.
+        ReceivedQuantity:
+          $ref: "#/components/schemas/Quantity"
+        PackageCount:
+          $ref: "#/components/schemas/Quantity"
+
+    ReceiptLineCreate:
+      type: object
+      required: [ReceiptID, SkuID, PkuID, ReceivedQuantity]
+      properties:
+        ReceiptID:
+          type: integer
+          format: int64
+        InboundOrderLineID:
+          type: integer
+          format: int64
+          nullable: true
+        SkuID:
+          type: integer
+          format: int64
+        PkuID:
+          type: integer
+          format: int64
+        LotID:
+          type: integer
+          format: int64
+          nullable: true
+        ReceivedQuantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Quantity received on this line, in `base_uom`.
+        PackageCount:
+          $ref: "#/components/schemas/Quantity"
+
+    # --------------------------------------------------- Outbound orders ----
+    OutboundOrder:
+      type: object
+      required: [ID, OrderNumber, Version, Status, Priority]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        TenantID:
+          type: integer
+          format: int64
+          nullable: true
+        OrderNumber:
+          type: string
+          example: SO-2026-0042
+        Version:
+          type: integer
+          format: int32
+          description: Optimistic-concurrency token. Echo back on every status change.
+        CustomerName:
+          type: string
+          nullable: true
+        Status:
+          $ref: "#/components/schemas/OrderStatus"
+        Priority:
+          type: integer
+          format: int32
+          description: Higher is dispatched first.
+          example: 5
+        CreatedAt:
+          type: string
+          format: date-time
+        UpdatedAt:
+          type: string
+          format: date-time
+
+    OutboundOrderCreate:
+      type: object
+      required: [OrderNumber]
+      properties:
+        OrderNumber:
+          type: string
+        CustomerName:
+          type: string
+          nullable: true
+        Status:
+          allOf:
+            - $ref: "#/components/schemas/OrderStatus"
+          default: PENDING
+        Priority:
+          type: integer
+          format: int32
+          default: 0
+
+    OutboundOrderLine:
+      type: object
+      required: [ID, OrderID, SkuID, PkuID]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        OrderID:
+          type: integer
+          format: int64
+        SkuID:
+          type: integer
+          format: int64
+        PkuID:
+          type: integer
+          format: int64
+        RequestedQuantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Requested in `base_uom`.
+        FulfilledQuantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Cumulative fulfilled, in `base_uom`. Constrained `<= RequestedQuantity`.
+
+    OutboundOrderLineCreate:
+      type: object
+      required: [OrderID, SkuID, PkuID, RequestedQuantity]
+      properties:
+        OrderID:
+          type: integer
+          format: int64
+        SkuID:
+          type: integer
+          format: int64
+        PkuID:
+          type: integer
+          format: int64
+        RequestedQuantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Quantity requested in `base_uom`. `(order_id, pku_id)` is unique.
+
+    OutboundOrderLineRow:
+      allOf:
+        - $ref: "#/components/schemas/OutboundOrderLine"
+        - type: object
+          description: '`GetOutboundOrderLines` join projection.'
+          properties:
+            SkuUuid:
+              type: integer
+              format: int64
+            SkuName:
+              type: string
+            UnitName:
+              type: string
+
+    # ------------------------------------------- Handling units/shipments ----
+    HandlingUnit:
+      type: object
+      required: [ID, OutboundOrderID]
+      description: |
+        A physical, reusable container (pallet, carton, tote). Distinct from a
+        packaging unit, which measures content. A handling unit can be packed,
+        staged and shipped repeatedly; packaging units are consumed.
+      properties:
+        ID:
+          type: integer
+          format: int64
+        OutboundOrderID:
+          type: integer
+          format: int64
+        ShipmentID:
+          type: integer
+          format: int64
+          nullable: true
+        Sscc:
+          type: string
+          nullable: true
+          description: GS1 Serial Shipping Container Code.
+        TrackingNumber:
+          type: string
+          nullable: true
+        TareWeightKg:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Weight of the empty unit.
+        GrossWeightKg:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Unit plus contents.
+        CreatedAt:
+          type: string
+          format: date-time
+
+    HandlingUnitCreate:
+      type: object
+      required: [OutboundOrderID]
+      properties:
+        OutboundOrderID:
+          type: integer
+          format: int64
+        Sscc:
+          type: string
+          nullable: true
+        TareWeightKg:
+          $ref: "#/components/schemas/Quantity"
+        GrossWeightKg:
+          $ref: "#/components/schemas/Quantity"
+
+    HandlingUnitContent:
+      type: object
+      required: [ID, HandlingUnitID, AllocationID]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        HandlingUnitID:
+          type: integer
+          format: int64
+        AllocationID:
+          type: integer
+          format: int64
+          description: '`inventory_allocations.id` — packing references the reservation, not the balance.'
+        PackedQuantity:
+          allOf:
+            - $ref: "#/components/schemas/Quantity"
+          description: Quantity packed into this unit, in `base_uom`.
+
+    AssignShipment:
+      type: object
+      required: [ShipmentID]
+      properties:
+        ShipmentID:
+          type: integer
+          format: int64
+        TrackingNumber:
+          type: string
+          nullable: true
+
+    Shipment:
+      type: object
+      required: [ID, ShipmentNumber, CarrierName, Status]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        ShipmentNumber:
+          type: string
+        CarrierName:
+          type: string
+        MasterTrackingNumber:
+          type: string
+          nullable: true
+        Status:
+          $ref: "#/components/schemas/ShipmentStatus"
+        ShippedAt:
+          type: string
+          format: date-time
+          nullable: true
+        CreatedAt:
+          type: string
+          format: date-time
+
+    ShipmentCreate:
+      type: object
+      required: [ShipmentNumber, CarrierName]
+      properties:
+        ShipmentNumber:
+          type: string
+        CarrierName:
+          type: string
+        MasterTrackingNumber:
+          type: string
+          nullable: true
+        Status:
+          allOf:
+            - $ref: "#/components/schemas/ShipmentStatus"
+          default: STAGED
+      x-handler-gap: >-
+        There is no `UpdateShipmentStatus` query, so a shipment can never be moved
+        to `SHIPPED` or `DELIVERED`, and `shipped_at` is never set. Add the SQL and
+        handler.
+
+    # ------------------------------------------------------ Tasks -----------
+    WarehouseTask:
+      type: object
+      required: [ID, TaskType, Status, Priority]
+      properties:
+        ID:
+          type: integer
+          format: int64
+        TaskType:
+          $ref: "#/components/schemas/TaskType"
+        Status:
+          $ref: "#/components/schemas/TaskStatus"
+        Priority:
+          type: integer
+          format: int32
+          description: Higher is dispatched first.
+        SkuID:
+          type: integer
+          format: int64
+          nullable: true
+        PkuID:
+          type: integer
+          format: int64
+          nullable: true
+        LotID:
+          type: integer
+          format: int64
+          nullable: true
+        PackageCount:
+          $ref: "#/components/schemas/Quantity"
+        Quantity:
+          $ref: "#/components/schemas/Quantity"
+        TargetNodeID:
+          type: integer
+          format: int64
+          nullable: true
+        SourceNodeID:
+          type: integer
+          format: int64
+          nullable: true
+        DestinationNodeID:
+          type: integer
+          format: int64
+          nullable: true
+        OrderLineID:
+          type: integer
+          format: int64
+          nullable: true
+        AllocationID:
+          type: integer
+          format: int64
+          nullable: true
+        AssignedOperatorID:
+          type: string
+          nullable: true
+        CreatedAt:
+          type: string
+          format: date-time
+        CompletedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    WarehouseTaskCreate:
+      type: object
+      required: [TaskType]
+      properties:
+        TaskType:
+          $ref: "#/components/schemas/TaskType"
+        Status:
+          allOf:
+            - $ref: "#/components/schemas/TaskStatus"
+          default: PENDING
+        Priority:
+          type: integer
+          format: int32
+          default: 0
+        SkuID:
+          type: integer
+          format: int64
+          nullable: true
+        PkuID:
+          type: integer
+          format: int64
+          nullable: true
+        LotID:
+          type: integer
+          format: int64
+          nullable: true
+        PackageCount:
+          $ref: "#/components/schemas/Quantity"
+        Quantity:
+          $ref: "#/components/schemas/Quantity"
+        TargetNodeID:
+          type: integer
+          format: int64
+          nullable: true
+        SourceNodeID:
+          type: integer
+          format: int64
+          nullable: true
+        DestinationNodeID:
+          type: integer
+          format: int64
+          nullable: true
+        OrderLineID:
+          type: integer
+          format: int64
+          nullable: true
+        AllocationID:
+          type: integer
+          format: int64
+          nullable: true
+
+    # ---------------------------------------------------------- Enums --------
+    Uom:
+      type: string
+      description: |
+        Unit of measure. The base unit is the SKU's atomic quantity — the only
+        unit in which all balance quantities are stored.
+      enum: [EACH, Kg, g, m, L, mL]
+
+    LotStatus:
+      type: string
+      description: |
+        Only `AVAILABLE` lots appear in `findReservableBalances`. Changing a lot's
+        status stops new allocations but does not remove existing balances.
+      enum: [AVAILABLE, QUARANTINED, EXPIRED, RECALLED]
+
+    StorageNodeType:
+      type: string
+      enum: [WAREHOUSE, ZONE, AISLE, BAY, BIN, PALLET, TOTE, CART]
+
+    MovementReason:
+      type: string
+      description: |
+        Why the stock moved. Constrains what the rest of the row may contain:
+        `allocation_id` is only valid for `PICK`, and `BREAK_PACKAGE`/`REPACKAGE`
+        model opening a sealed container — the project leg and the destination leg
+        are both recorded, giving the ledger its double-entry property.
+      enum:
+        - RECEIVING
+        - PUTAWAY
+        - PICK
+        - REPLENISHMENT
+        - INTERNAL_TRANSFER
+        - BREAK_PACKAGE
+        - REPACKAGE
+        - CYCLE_COUNT
+        - SCRAP_DAMAGED
+        - RETURN
+
+    OrderStatus:
+      type: string
+      description: |
+        Outbound lifecycle: `PENDING -> ALLOCATED -> PICKING -> PACKED -> SHIPPED`,
+        with `PARTIALLY_ALLOCATED` when only some lines were satisfiable and
+        `CANCELLED` reachable from any pre-`SHIPPED` state.
+      enum: [PENDING, ALLOCATED, PARTIALLY_ALLOCATED, PICKING, PACKED, SHIPPED, CANCELLED]
+
+    InboundOrderStatus:
+      type: string
+      description: |
+        Inbound lifecycle: `DRAFT -> ISSUED -> PARTIALLY_RECEIVED -> RECEIVED`,
+        with `CANCELLED` reachable from any pre-`RECEIVED` state.
+      enum: [DRAFT, ISSUED, PARTIALLY_RECEIVED, RECEIVED, CANCELLED]
+
+    ReceiptStatus:
+      type: string
+      enum: [RECEIVING, COMPLETED, CANCELLED]
+
+    ShipmentStatus:
+      type: string
+      enum: [STAGED, SHIPPED, DELIVERED, CANCELLED]
+
+    TaskType:
+      type: string
+      enum: [PUTAWAY, PICK, REPLENISH, COUNT, RELOCATE_NODE]
+
+    TaskStatus:
+      type: string
+      enum: [PENDING, ASSIGNED, IN_PROGRESS, COMPLETED, CANCELLED]
