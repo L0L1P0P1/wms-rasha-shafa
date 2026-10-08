@@ -75,7 +75,7 @@ func (h *InboundOrderHandler) GetInboundOrderByPONumber(w http.ResponseWriter, r
 func (h *InboundOrderHandler) GetInboundOrderLines(w http.ResponseWriter, r *http.Request) {
 	logger := ctxlog.FromContext(r.Context())
 
-	idStr := r.PathValue("inbound_order_id")
+	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		shared.ErrorJSON(w, err)

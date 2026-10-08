@@ -154,7 +154,7 @@ func (h *OutboundOrderHandler) GetOutboundOrderByNumber(w http.ResponseWriter, r
 func (h *OutboundOrderHandler) GetOutboundOrderLines(w http.ResponseWriter, r *http.Request) {
 	logger := ctxlog.FromContext(r.Context())
 
-	idStr := r.PathValue("order_id")
+	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		shared.ErrorJSON(w, err)
